@@ -13,7 +13,18 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "dotenv -e .env -- drizzle-kit studio"
+    "db:studio": "dotenv -e .env -- drizzle-kit studio",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:restart": "docker compose down && docker compose up -d --build",
+    "docker:ps": "docker compose ps",
+    "docker:logs": "docker compose logs -f app",
+    "docker:migrate": "docker compose run --rm app pnpm db:migrate",
+    "docker:db:shell": "docker compose exec postgres psql -U healthage -d healthage",
+    "docker:db:dump": "docker compose exec postgres pg_dump -U healthage -d healthage > backup.sql",
+    "docker:studio": "docker compose --profile tools up -d studio",
+    "docker:studio:logs": "docker compose --profile tools logs -f studio",
+    "docker:studio:down": "docker compose --profile tools stop studio"
   },
   "dependencies": {
     "@fastify/autoload": "^6.3.1",

@@ -13,9 +13,35 @@ fi
 
 source /etc/os-release
 
+install_compose_plugin_binary() {
+  if docker compose version >/dev/null 2>&1; then
+    return
+  fi
+
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *)
+      echo "Unsupported architecture for compose plugin auto-install: $arch"
+      return
+      ;;
+  esac
+
+  mkdir -p "${HOME}/.docker/cli-plugins"
+  curl -fsSL "https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-${arch}" \
+    -o "${HOME}/.docker/cli-plugins/docker-compose"
+  chmod +x "${HOME}/.docker/cli-plugins/docker-compose"
+}
+
 install_amazon_linux() {
   sudo dnf update -y
-  sudo dnf install -y docker git nginx curl
+  sudo dnf install -y docker git nginx
+
+  # Resolve curl/curl-minimal conflicts if present
+  sudo dnf install -y curl --allowerasing || true
+
   sudo systemctl enable docker
   sudo systemctl start docker
   sudo systemctl enable nginx
@@ -57,7 +83,12 @@ if ! groups "${USER}" | grep -q '\bdocker\b'; then
   echo "Added ${USER} to docker group. Re-login (or run 'newgrp docker') before using docker without sudo."
 fi
 
+install_compose_plugin_binary
+
 echo "Installation complete."
+echo "Docker: $(docker --version || true)"
+echo "Compose: $(docker compose version || echo 'not available yet; re-login and retry')"
+echo "Nginx: $(nginx -v 2>&1 || true)"
 echo "Next steps:"
 echo "1) Re-login (or: newgrp docker)"
 echo "2) cd your repo"
