@@ -24,7 +24,9 @@
     "docker:db:dump": "docker compose exec postgres pg_dump -U healthage -d healthage > backup.sql",
     "docker:studio": "docker compose --profile tools up -d studio",
     "docker:studio:logs": "docker compose --profile tools logs -f studio",
-    "docker:studio:down": "docker compose --profile tools stop studio"
+    "docker:studio:down": "docker compose --profile tools stop studio",
+    "docker:studio:public": "docker compose --profile tools up -d --force-recreate studio",
+    "docker:studio:url": "echo http://<EC2_PUBLIC_IP>:4983"
   },
   "dependencies": {
     "@fastify/autoload": "^6.3.1",
