@@ -26,7 +26,9 @@
     "docker:studio:logs": "docker compose --profile tools logs -f studio",
     "docker:studio:down": "docker compose --profile tools stop studio",
     "docker:studio:public": "docker compose --profile tools up -d --force-recreate studio",
-    "docker:studio:url": "echo http://<EC2_PUBLIC_IP>:4983"
+    "docker:studio:url": "echo https://local.drizzle.studio/?host=http://<EC2_PUBLIC_IP>:4983",
+    "ec2:nginx": "./scripts/configure-nginx-ec2.sh ha.wisdomtooth.tech",
+    "ec2:nginx:ssl": "ENABLE_SSL=true ./scripts/configure-nginx-ec2.sh ha.wisdomtooth.tech"
   },
   "dependencies": {
     "@fastify/autoload": "^6.3.1",

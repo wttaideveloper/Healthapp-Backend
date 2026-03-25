@@ -22,30 +22,16 @@ fi
 echo "Building and starting containers..."
 docker compose up -d --build
 
-CONFIGURE_NGINX="${CONFIGURE_NGINX:-true}"
-NGINX_SERVER_NAME="${NGINX_SERVER_NAME:-_}"
+CONFIGURE_NGINX="${CONFIGURE_NGINX:-false}"
+NGINX_SERVER_NAME="${NGINX_SERVER_NAME:-ha.wisdomtooth.tech}"
 
-if [[ "$CONFIGURE_NGINX" == "true" ]] && command -v nginx >/dev/null 2>&1; then
-  echo "Configuring nginx reverse proxy (server_name: ${NGINX_SERVER_NAME})..."
-  sudo tee /etc/nginx/conf.d/healthage.conf >/dev/null <<NGINX
-server {
-  listen 80;
-  server_name ${NGINX_SERVER_NAME};
-
-  location / {
-    proxy_pass http://127.0.0.1:8091;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
-}
-NGINX
-
-  sudo rm -f /etc/nginx/conf.d/default.conf
-  sudo nginx -t
-  sudo systemctl reload nginx
+if [[ "$CONFIGURE_NGINX" == "true" ]]; then
+  if [[ -x "./scripts/configure-nginx-ec2.sh" ]]; then
+    ./scripts/configure-nginx-ec2.sh "${NGINX_SERVER_NAME}"
+  else
+    echo "scripts/configure-nginx-ec2.sh is missing or not executable."
+    exit 1
+  fi
 fi
 
 echo "Container status:"
@@ -56,6 +42,5 @@ docker compose logs --tail=80 app || true
 
 echo "Deployment complete."
 echo "Local health check: curl http://127.0.0.1:8091/api/v1/health"
-if [[ "$CONFIGURE_NGINX" == "true" ]]; then
-  echo "Public health check: curl http://<EC2_PUBLIC_IP>/api/v1/health"
-fi
+echo "Public health check (domain): curl http://${NGINX_SERVER_NAME}/api/v1/health"
+echo "Tip: first-time domain setup: ./scripts/configure-nginx-ec2.sh ${NGINX_SERVER_NAME}"
