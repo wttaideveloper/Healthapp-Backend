@@ -1,0 +1,7 @@
+node_modules
+dist
+.pnpm-store
+frontend
+.git
+.gitignore
+.DS_Store

@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: healthage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: healthage
+      POSTGRES_USER: healthage
+      POSTGRES_PASSWORD: healthage
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthage -d healthage"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: healthage-backend-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8091:8091"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://healthage:healthage@postgres:5432/healthage?sslmode=disable
+      RUN_MIGRATIONS: "true"
+      NODE_ENV: production
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8091/api/v1/health/ready >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

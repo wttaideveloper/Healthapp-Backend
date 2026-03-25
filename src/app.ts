@@ -1,0 +1,81 @@
+import fastifySwagger from "@fastify/swagger";
+import fastifySwaggerUi from "@fastify/swagger-ui";
+import fastifyCors from "@fastify/cors";
+import fastifyRawBody from "fastify-raw-body";
+import Fastify, { FastifyInstance } from "fastify";
+import { serializerCompiler, validatorCompiler, ZodTypeProvider } from "fastify-type-provider-zod";
+
+import { env } from "@config/env";
+import { errorHandlerPlugin } from "@plugins/error-handler.plugin";
+import { dbLivePlugin } from "@plugins/db-live.plugin";
+import { dbPlugin } from "@plugins/db.plugin";
+import { authPlugin } from "@plugins/auth.plugin";
+import { healthRoutes } from "./modules/health/health.route";
+import { authRoutes } from "./modules/auth/auth.route";
+import { licenseRoutes } from "./modules/license/license.route";
+import { stripeRoutes } from "./modules/stripe/stripe.route";
+import { adminLicenseRoutes } from "./modules/admin/admin-license.route";
+import { adminUserRoutes } from "./modules/admin/admin-user.route";
+
+export async function buildApp(): Promise<FastifyInstance> {
+    const app = Fastify({
+        logger: {
+            level: env.LOG_LEVEL,
+            transport:
+                env.NODE_ENV === "development"
+                    ? { target: "pino-pretty" }
+                    : undefined,
+        },
+    });
+
+    /* ---------------- ZOD SETUP ---------------- */
+    app.setValidatorCompiler(validatorCompiler);
+    app.setSerializerCompiler(serializerCompiler);
+
+    await app.register(fastifyRawBody, {
+        field: "rawBody",
+        global: false,
+        runFirst: true,
+        encoding: false,
+    });
+
+    /* ---------------- CORS ---------------- */
+    await app.register(fastifyCors, {
+        origin: true, // reflect request origin (good for localhost ports during dev)
+        methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allowedHeaders: ["Content-Type", "Authorization", "x-bootstrap-token"],
+        optionsSuccessStatus: 204,
+    });
+
+    /* ---------------- SWAGGER ---------------- */
+    await app.register(fastifySwagger, {
+        openapi: {
+            info: {
+                title: "HealthAge API",
+                version: "1.0.0",
+            },
+        },
+    });
+
+    await app.register(fastifySwaggerUi, {
+        routePrefix: "/docs",
+    });
+
+    /* ---------------- PLUGINS (ORDER MATTERS) ---------------- */
+    await app.register(dbPlugin);            // app.db + app.pgPool
+    await app.register(dbLivePlugin);        // app.isDbLive
+    await app.register(authPlugin);
+    await app.register(errorHandlerPlugin);   // custom error handler
+
+    /* ---------------- ROUTES (TYPED) ---------------- */
+
+    const typedApp = app.withTypeProvider<ZodTypeProvider>();
+    typedApp.register(healthRoutes, { prefix: '/api/v1/health' });
+    typedApp.register(authRoutes, { prefix: "/api/v1/auth" });
+    typedApp.register(licenseRoutes, { prefix: "/api/v1/licenses" });
+    typedApp.register(stripeRoutes, { prefix: "/api/v1/stripe" });
+    typedApp.register(adminLicenseRoutes, { prefix: "/api/v1/admin" });
+    typedApp.register(adminUserRoutes, { prefix: "/api/v1/admin" });
+
+    return app;
+}
