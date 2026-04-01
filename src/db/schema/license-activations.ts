@@ -23,7 +23,7 @@ export const licenseActivations = pgTable(
             .defaultNow()
             .notNull(),
     },
-    (table) => [uniqueIndex("idx_license_device_unique").on(table.licenseId, table.deviceId)]
+    (table) => [uniqueIndex("idx_license_user_device_unique").on(table.licenseId, table.userId, table.deviceId)]
 );
 
 export type SelectLicenseActivation = typeof licenseActivations.$inferSelect;

@@ -3,6 +3,7 @@ import { users } from "./users";
 import { relations } from "drizzle-orm";
 
 import { emailVerifications } from "./email-verifications";
+import { passwordResets } from "./password-resets";
 import { licenses } from "./licenses";
 import { licenseActivations } from "./license-activations";
 import { revenuecatSubscriptions } from "./revenuecat-subscriptions";
@@ -11,6 +12,7 @@ import { stripeSubscriptions } from "./stripe-subscriptions";
 
 export const userRelations = relations(users, ({ many, one }) => ({
     emailVerifications: many(emailVerifications),
+    passwordResets: many(passwordResets),
 
     license: one(licenses, {
         fields: [users.licenseId],
@@ -37,6 +39,16 @@ export const emailVerificationRelations = relations(
     ({ one }) => ({
         user: one(users, {
             fields: [emailVerifications.userId],
+            references: [users.id],
+        }),
+    })
+);
+
+export const passwordResetRelations = relations(
+    passwordResets,
+    ({ one }) => ({
+        user: one(users, {
+            fields: [passwordResets.userId],
             references: [users.id],
         }),
     })

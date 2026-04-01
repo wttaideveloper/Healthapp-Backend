@@ -127,6 +127,7 @@ export const licenseRoutes: FastifyPluginAsyncZod = async (app) => {
                 .where(
                     and(
                         eq(licenseActivations.licenseId, license.id),
+                        eq(licenseActivations.userId, user.id),
                         eq(licenseActivations.deviceId, normalizedDeviceId)
                     )
                 )
@@ -407,11 +408,14 @@ export const licenseRoutes: FastifyPluginAsyncZod = async (app) => {
                 .where(and(eq(licenseActivations.userId, user.id), eq(licenseActivations.licenseId, license.id)))
                 .orderBy(desc(licenseActivations.activatedAt));
 
+            const hasActivationForUser = activationRows.length > 0;
+            const normalizedEnterpriseLicense = enterpriseIsLicensed && hasActivationForUser;
+
             return {
-                isLicensed: enterpriseIsLicensed,
+                isLicensed: normalizedEnterpriseLicense,
                 expiresAt: license.expiresAt?.toISOString() ?? null,
                 provider: "enterprise" as const,
-                providerStatus: license.isActive ? "active" : "inactive",
+                providerStatus: normalizedEnterpriseLicense ? "active" : "inactive",
                 autoRenewing: null,
                 license: {
                     id: license.id,

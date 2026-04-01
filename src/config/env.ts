@@ -10,6 +10,7 @@ const envSchema = z.object({
     SMTP_PORT: z.coerce.number().min(1),
     SMTP_USER: z.string().min(1),
     SMTP_PASS: z.string().min(1),
+    EMAIL_FROM: z.string().min(1).optional(),
     ADMIN_EMAILS: z.string().optional(),
     ADMIN_BOOTSTRAP_TOKEN: z.string().optional(),
     STRIPE_SECRET_KEY: z.string().min(1).optional(),

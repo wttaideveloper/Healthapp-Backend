@@ -1,9 +1,11 @@
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 import z from "zod";
+import nodemailer from "nodemailer";
+import { createHash, randomInt } from "node:crypto";
 
-import { users } from "@db/schema";
-import { ConflictError, UnauthorizedError } from "@core/errors/http-errors";
+import { passwordResets, users } from "@db/schema";
+import { BadRequestError, ConflictError, UnauthorizedError } from "@core/errors/http-errors";
 import { hashPassword, verifyPassword } from "@core/security/password";
 import { env } from "@config/env";
 
@@ -31,6 +33,29 @@ const authResponseSchema = z.object({
     }),
 });
 
+const forgotPasswordBodySchema = z.object({
+    email: z.string().trim().email(),
+});
+
+const forgotPasswordResponseSchema = z.object({
+    ok: z.literal(true),
+    message: z.string(),
+});
+
+const resetPasswordBodySchema = z.object({
+    email: z.string().trim().email(),
+    otp: z
+        .string()
+        .trim()
+        .regex(/^\d{6}$/, "OTP must be a 6-digit code"),
+    newPassword: z.string().min(8).max(128),
+});
+
+const resetPasswordResponseSchema = z.object({
+    ok: z.literal(true),
+    message: z.string(),
+});
+
 const meResponseSchema = z.object({
     id: z.string().uuid(),
     name: z.string(),
@@ -44,6 +69,10 @@ const meResponseSchema = z.object({
 
 function sanitizeEmail(email: string): string {
     return email.trim().toLowerCase();
+}
+
+function hashResetToken(token: string): string {
+    return createHash("sha256").update(token).digest("hex");
 }
 
 function isBootstrapAdminEmail(email: string): boolean {
@@ -60,6 +89,16 @@ function isBootstrapAdminEmail(email: string): boolean {
 }
 
 export const authRoutes: FastifyPluginAsyncZod = async (app) => {
+    const smtpTransport = nodemailer.createTransport({
+        host: env.SMTP_HOST,
+        port: env.SMTP_PORT,
+        secure: env.SMTP_PORT === 465,
+        auth: {
+            user: env.SMTP_USER,
+            pass: env.SMTP_PASS,
+        },
+    });
+
     app.post(
         "/register",
         {
@@ -111,6 +150,123 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                     status: newUser.status,
                 },
             });
+        }
+    );
+
+    app.post(
+        "/forgot-password",
+        {
+            schema: {
+                summary: "Request password reset email",
+                body: forgotPasswordBodySchema,
+                response: {
+                    200: forgotPasswordResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const email = sanitizeEmail(req.body.email);
+
+            const [foundUser] = await app.db
+                .select()
+                .from(users)
+                .where(and(eq(users.email, email), eq(users.status, "active")))
+                .limit(1);
+
+            if (foundUser) {
+                const otp = String(randomInt(0, 1_000_000)).padStart(6, "0");
+                const tokenHash = hashResetToken(otp);
+                const expiresAt = new Date(Date.now() + 1000 * 60 * 10);
+
+                await app.db.insert(passwordResets).values({
+                    userId: foundUser.id,
+                    tokenHash,
+                    expiresAt,
+                });
+
+                await smtpTransport.sendMail({
+                    from: env.EMAIL_FROM ?? env.SMTP_USER,
+                    to: foundUser.email,
+                    subject: "Your HealthAge password reset code",
+                    text: `Your HealthAge password reset OTP is ${otp}. It expires in 10 minutes.`,
+                    html: `<p>Your HealthAge password reset OTP is <strong>${otp}</strong>.</p><p>This code expires in 10 minutes.</p>`,
+                });
+            }
+
+            return {
+                ok: true as const,
+                message: "If an account with that email exists, a reset link has been sent.",
+            };
+        }
+    );
+
+    app.post(
+        "/reset-password",
+        {
+            schema: {
+                summary: "Reset password with reset token",
+                body: resetPasswordBodySchema,
+                response: {
+                    200: resetPasswordResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const email = sanitizeEmail(req.body.email);
+            const now = new Date();
+            const [foundUser] = await app.db
+                .select()
+                .from(users)
+                .where(and(eq(users.email, email), eq(users.status, "active")))
+                .limit(1);
+
+            if (!foundUser) {
+                throw new BadRequestError("Invalid OTP or email");
+            }
+
+            const tokenHash = hashResetToken(req.body.otp);
+
+            const [activeReset] = await app.db
+                .select()
+                .from(passwordResets)
+                .where(
+                    and(
+                        eq(passwordResets.userId, foundUser.id),
+                        eq(passwordResets.tokenHash, tokenHash),
+                        isNull(passwordResets.consumedAt),
+                        gt(passwordResets.expiresAt, now)
+                    )
+                )
+                .orderBy(desc(passwordResets.createdAt))
+                .limit(1);
+
+            if (!activeReset) {
+                throw new BadRequestError("Invalid or expired OTP");
+            }
+
+            const newPasswordHash = await hashPassword(req.body.newPassword);
+
+            await app.db.transaction(async (tx) => {
+                await tx
+                    .update(users)
+                    .set({
+                        passwordHash: newPasswordHash,
+                        updatedAt: now,
+                    })
+                    .where(eq(users.id, activeReset.userId));
+
+                await tx
+                    .update(passwordResets)
+                    .set({
+                        consumedAt: now,
+                    })
+                    .where(eq(passwordResets.id, activeReset.id));
+            });
+
+            return {
+                ok: true as const,
+                message: "Password updated successfully.",
+            };
         }
     );
 
