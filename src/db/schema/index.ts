@@ -10,6 +10,7 @@ export * from "./password-resets"
 export * from "./licenses";
 export * from "./license-activations";
 export * from "./revenuecat-subscriptions";
+export * from "./store-entitlements";
 export * from "./stripe-customers";
 export * from "./stripe-subscriptions";
 export * from "./billing-events";

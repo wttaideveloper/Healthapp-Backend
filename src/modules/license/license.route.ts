@@ -1,9 +1,23 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { randomUUID } from "node:crypto";
 import z from "zod";
 
-import { users, licenses, licenseActivations, revenuecatSubscriptions, stripeSubscriptions } from "@db/schema";
-import { BadRequestError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
+import {
+    billingEvents,
+    users,
+    licenses,
+    licenseActivations,
+    revenuecatSubscriptions,
+    storeEntitlements,
+    stripeSubscriptions,
+} from "@db/schema";
+import {
+    BadRequestError,
+    EntitlementOwnedByAnotherUserError,
+    ForbiddenError,
+    NotFoundError,
+} from "@core/errors/http-errors";
 import { hashLicenseKey } from "@core/security/license-key";
 
 const activateLicenseBodySchema = z.object({
@@ -24,13 +38,14 @@ const licenseResponseSchema = z.object({
 const revenuecatSyncBodySchema = z.object({
     appUserId: z.string().trim().min(1).max(255).optional(),
     platform: z.enum(["ios", "android", "macos"]),
+    action: z.enum(["purchase", "restore", "status_check"]),
     entitlementId: z.enum(["pro"]),
     isActive: z.boolean(),
     autoRenewing: z.boolean(),
     expiryDate: z.string().datetime().nullable().optional(),
     productId: z.string().trim().min(1).max(255).nullable().optional(),
     transactionId: z.string().trim().min(1).max(255).nullable().optional(),
-    originalTransactionId: z.string().trim().min(1).max(255).nullable().optional(),
+    originalTransactionId: z.string().trim().min(1).max(255),
     customerInfo: z
         .object({
             originalAppUserId: z.string().trim().min(1).max(255).optional(),
@@ -58,6 +73,238 @@ function isRevenuecatLicenseActive(isActive: boolean, expiresAt: Date | null): b
     if (!isActive) return false;
     if (!expiresAt) return true;
     return expiresAt.getTime() > Date.now();
+}
+
+function mapRevenuecatStore(platform: "ios" | "android" | "macos"): "app_store" | "play_store" {
+    return platform === "android" ? "play_store" : "app_store";
+}
+
+function mapRevenuecatStatus(isActive: boolean, expiresAt: Date | null): "active" | "expired" {
+    if (!isActive) return "expired";
+    if (!expiresAt) return "active";
+    return expiresAt.getTime() > Date.now() ? "active" : "expired";
+}
+
+function isStoreEntitlementActive(isActive: boolean, expiresAt: Date | null): boolean {
+    if (!isActive) return false;
+    if (!expiresAt) return true;
+    return expiresAt.getTime() > Date.now();
+}
+
+async function writeRevenuecatAuditEvent(
+    app: Parameters<FastifyPluginAsyncZod>[0],
+    payload: Record<string, unknown>,
+    eventType: string
+) {
+    await app.db.insert(billingEvents).values({
+        provider: "revenuecat",
+        eventId: randomUUID(),
+        eventType,
+        payloadJson: payload,
+    });
+}
+
+async function getOwnedRevenuecatEntitlement(
+    app: Parameters<FastifyPluginAsyncZod>[0],
+    userId: string
+) {
+    const now = new Date();
+
+    const [row] = await app.db
+        .select()
+        .from(storeEntitlements)
+        .where(
+            and(
+                eq(storeEntitlements.ownerUserId, userId),
+                eq(storeEntitlements.isActive, true),
+                or(isNull(storeEntitlements.expiresAt), gt(storeEntitlements.expiresAt, now))
+            )
+        )
+        .orderBy(desc(storeEntitlements.expiresAt), desc(storeEntitlements.updatedAt))
+        .limit(1);
+
+    return row ?? null;
+}
+
+async function getNormalizedLicenseState(
+    app: Parameters<FastifyPluginAsyncZod>[0],
+    userId: string
+) {
+    const [user] = await app.db.select().from(users).where(eq(users.id, userId)).limit(1);
+    if (!user) {
+        return {
+            isLicensed: false,
+            expiresAt: null as string | null,
+            provider: null as "enterprise" | "revenuecat" | "stripe" | null,
+            providerStatus: null as string | null,
+            autoRenewing: null as boolean | null,
+            license: null as z.infer<typeof licenseResponseSchema> | null,
+            activations: [] as Array<{
+                id: string;
+                deviceId: string;
+                platform: string | null;
+                activatedAt: string;
+            }>,
+        };
+    }
+
+    const [stripeSubscription, revenuecatEntitlement] = await Promise.all([
+        app.db
+            .select()
+            .from(stripeSubscriptions)
+            .where(eq(stripeSubscriptions.userId, user.id))
+            .orderBy(desc(stripeSubscriptions.updatedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null),
+        getOwnedRevenuecatEntitlement(app, user.id),
+    ]);
+
+    const stripeIsLicensed = stripeSubscription
+        ? isStripeLicenseActive(stripeSubscription.status, stripeSubscription.currentPeriodEnd)
+        : false;
+    const revenuecatIsLicensed = revenuecatEntitlement
+        ? isStoreEntitlementActive(revenuecatEntitlement.isActive, revenuecatEntitlement.expiresAt)
+        : false;
+
+    if (!user.licenseId) {
+        if (stripeIsLicensed) {
+            return {
+                isLicensed: true,
+                expiresAt: stripeSubscription?.currentPeriodEnd?.toISOString() ?? null,
+                provider: "stripe" as const,
+                providerStatus: stripeSubscription?.providerStatus ?? stripeSubscription?.status ?? null,
+                autoRenewing: stripeSubscription?.autoRenewing ?? null,
+                license: null,
+                activations: [],
+            };
+        }
+
+        if (revenuecatIsLicensed) {
+            return {
+                isLicensed: true,
+                expiresAt: revenuecatEntitlement?.expiresAt?.toISOString() ?? null,
+                provider: "revenuecat" as const,
+                providerStatus: revenuecatEntitlement?.status ?? "active",
+                autoRenewing: null,
+                license: null,
+                activations: [],
+            };
+        }
+
+        return {
+            isLicensed: false,
+            expiresAt: null,
+            provider: null,
+            providerStatus: null,
+            autoRenewing: null,
+            license: null,
+            activations: [],
+        };
+    }
+
+    const [license] = await app.db.select().from(licenses).where(eq(licenses.id, user.licenseId)).limit(1);
+    if (!license) {
+        if (stripeIsLicensed) {
+            return {
+                isLicensed: true,
+                expiresAt: stripeSubscription?.currentPeriodEnd?.toISOString() ?? null,
+                provider: "stripe" as const,
+                providerStatus: stripeSubscription?.providerStatus ?? stripeSubscription?.status ?? null,
+                autoRenewing: stripeSubscription?.autoRenewing ?? null,
+                license: null,
+                activations: [],
+            };
+        }
+
+        if (revenuecatIsLicensed) {
+            return {
+                isLicensed: true,
+                expiresAt: revenuecatEntitlement?.expiresAt?.toISOString() ?? null,
+                provider: "revenuecat" as const,
+                providerStatus: revenuecatEntitlement?.status ?? "active",
+                autoRenewing: null,
+                license: null,
+                activations: [],
+            };
+        }
+
+        return {
+            isLicensed: false,
+            expiresAt: null,
+            provider: null,
+            providerStatus: null,
+            autoRenewing: null,
+            license: null,
+            activations: [],
+        };
+    }
+
+    const enterpriseIsLicensed = isEnterpriseLicenseActive(license.isActive, license.expiresAt);
+    const activationRows = await app.db
+        .select()
+        .from(licenseActivations)
+        .where(and(eq(licenseActivations.userId, user.id), eq(licenseActivations.licenseId, license.id)))
+        .orderBy(desc(licenseActivations.activatedAt));
+
+    const normalizedEnterpriseLicense = enterpriseIsLicensed && activationRows.length > 0;
+
+    if (normalizedEnterpriseLicense) {
+        return {
+            isLicensed: true,
+            expiresAt: license.expiresAt?.toISOString() ?? null,
+            provider: "enterprise" as const,
+            providerStatus: "active",
+            autoRenewing: null,
+            license: {
+                id: license.id,
+                organizationName: license.organizationName,
+                allowedEmailDomain: license.allowedEmailDomain,
+                maxActivations: license.maxActivations,
+                expiresAt: license.expiresAt?.toISOString() ?? null,
+                isActive: license.isActive,
+            },
+            activations: activationRows.map((row) => ({
+                id: row.id,
+                deviceId: row.deviceId,
+                platform: row.platform,
+                activatedAt: row.activatedAt.toISOString(),
+            })),
+        };
+    }
+
+    if (stripeIsLicensed) {
+        return {
+            isLicensed: true,
+            expiresAt: stripeSubscription?.currentPeriodEnd?.toISOString() ?? null,
+            provider: "stripe" as const,
+            providerStatus: stripeSubscription?.providerStatus ?? stripeSubscription?.status ?? null,
+            autoRenewing: stripeSubscription?.autoRenewing ?? null,
+            license: null,
+            activations: [],
+        };
+    }
+
+    if (revenuecatIsLicensed) {
+        return {
+            isLicensed: true,
+            expiresAt: revenuecatEntitlement?.expiresAt?.toISOString() ?? null,
+            provider: "revenuecat" as const,
+            providerStatus: revenuecatEntitlement?.status ?? "active",
+            autoRenewing: null,
+            license: null,
+            activations: [],
+        };
+    }
+
+    return {
+        isLicensed: false,
+        expiresAt: null,
+        provider: null,
+        providerStatus: null,
+        autoRenewing: null,
+        license: null,
+        activations: [],
+    };
 }
 
 function isEnterpriseLicenseActive(isActive: boolean, expiresAt: Date | null): boolean {
@@ -192,14 +439,19 @@ export const licenseRoutes: FastifyPluginAsyncZod = async (app) => {
                             expiresAt: z.string().datetime().nullable(),
                         }),
                     }),
+                    409: z.object({
+                        code: z.literal("ENTITLEMENT_OWNED_BY_ANOTHER_USER"),
+                        message: z.string(),
+                    }),
                 },
             },
         },
-        async (req) => {
+        async (req, reply) => {
             const userId = req.authUser!.sub;
             const {
                 appUserId,
                 platform,
+                action,
                 entitlementId,
                 isActive,
                 autoRenewing,
@@ -224,56 +476,187 @@ export const licenseRoutes: FastifyPluginAsyncZod = async (app) => {
 
             const normalizedIsLicensed = isRevenuecatLicenseActive(isActive, expiresAt);
             const now = new Date();
+            const store = mapRevenuecatStore(platform);
+            const status = mapRevenuecatStatus(isActive, expiresAt);
 
-            await app.db
-                .insert(revenuecatSubscriptions)
-                .values({
+            await writeRevenuecatAuditEvent(
+                app,
+                {
                     userId,
-                    appUserId: userId,
+                    bodyAppUserId: appUserId ?? null,
+                    action,
                     platform,
+                    store,
                     entitlementId,
                     isActive,
                     autoRenewing,
-                    expiresAt,
+                    expiryDate: expiryDate ?? null,
                     productId: productId ?? null,
                     transactionId: transactionId ?? null,
-                    originalTransactionId: originalTransactionId ?? null,
-                    customerInfo: customerInfo ?? null,
-                    lastSource: "revenuecat_client_sync",
-                    lastSyncedAt: now,
-                })
-                .onConflictDoUpdate({
-                    target: revenuecatSubscriptions.userId,
-                    set: {
-                        appUserId: userId,
-                        platform,
-                        entitlementId,
-                        isActive,
-                        autoRenewing,
-                        expiresAt,
-                        productId: productId ?? null,
-                        transactionId: transactionId ?? null,
-                        originalTransactionId: originalTransactionId ?? null,
-                        customerInfo: customerInfo ?? null,
-                        lastSource: "revenuecat_client_sync",
-                        lastSyncedAt: now,
-                        updatedAt: now,
-                    },
-                });
+                    originalTransactionId,
+                },
+                `client_sync.${action}`
+            );
 
-            await app.db
-                .update(users)
-                .set({
-                    isLicensed: normalizedIsLicensed,
-                    updatedAt: now,
-                })
-                .where(eq(users.id, userId));
+            try {
+                await app.db.transaction(async (tx) => {
+                    const [existingEntitlement] = await tx
+                        .select()
+                        .from(storeEntitlements)
+                        .where(
+                            and(
+                                eq(storeEntitlements.store, store),
+                                eq(storeEntitlements.originalTransactionId, originalTransactionId)
+                            )
+                        )
+                        .limit(1);
+
+                    const canClaimOwnership = action === "purchase" || action === "restore";
+
+                    if (!existingEntitlement) {
+                        await tx.insert(storeEntitlements).values({
+                            platform,
+                            store,
+                            originalTransactionId,
+                            latestTransactionId: transactionId ?? null,
+                            productId: productId ?? null,
+                            entitlementId,
+                            expiresAt,
+                            isActive,
+                            ownerUserId: canClaimOwnership ? userId : null,
+                            status,
+                            lastSeenAt: now,
+                        });
+                    } else if (existingEntitlement.ownerUserId === null) {
+                        if (canClaimOwnership) {
+                            await tx
+                                .update(storeEntitlements)
+                                .set({
+                                    platform,
+                                    latestTransactionId: transactionId ?? null,
+                                    productId: productId ?? null,
+                                    entitlementId,
+                                    expiresAt,
+                                    isActive,
+                                    ownerUserId: userId,
+                                    status,
+                                    lastSeenAt: now,
+                                    updatedAt: now,
+                                })
+                                .where(eq(storeEntitlements.id, existingEntitlement.id));
+                        }
+                    } else if (existingEntitlement.ownerUserId !== userId) {
+                        await tx.insert(billingEvents).values({
+                            provider: "revenuecat",
+                            eventId: randomUUID(),
+                            eventType: "ownership_conflict",
+                            payloadJson: {
+                                authUserId: userId,
+                                currentOwnerUserId: existingEntitlement.ownerUserId,
+                                action,
+                                platform,
+                                store,
+                                originalTransactionId,
+                                transactionId: transactionId ?? null,
+                            },
+                        });
+
+                        throw new EntitlementOwnedByAnotherUserError();
+                    } else {
+                        await tx
+                            .update(storeEntitlements)
+                            .set({
+                                platform,
+                                latestTransactionId: transactionId ?? null,
+                                productId: productId ?? null,
+                                entitlementId,
+                                expiresAt,
+                                isActive,
+                                status,
+                                lastSeenAt: now,
+                                updatedAt: now,
+                            })
+                            .where(eq(storeEntitlements.id, existingEntitlement.id));
+                    }
+
+                    const [ownedEntitlement] = await tx
+                        .select()
+                        .from(storeEntitlements)
+                        .where(
+                            and(
+                                eq(storeEntitlements.store, store),
+                                eq(storeEntitlements.originalTransactionId, originalTransactionId),
+                                eq(storeEntitlements.ownerUserId, userId)
+                            )
+                        )
+                        .limit(1);
+
+                    if (!ownedEntitlement) {
+                        return;
+                    }
+
+                    await tx
+                        .insert(revenuecatSubscriptions)
+                        .values({
+                            userId,
+                            appUserId: userId,
+                            platform,
+                            entitlementId,
+                            isActive,
+                            autoRenewing,
+                            expiresAt,
+                            productId: productId ?? null,
+                            transactionId: transactionId ?? null,
+                            originalTransactionId,
+                            customerInfo: customerInfo ?? null,
+                            lastSource: "revenuecat_client_sync",
+                            lastSyncedAt: now,
+                        })
+                        .onConflictDoUpdate({
+                            target: revenuecatSubscriptions.userId,
+                            set: {
+                                appUserId: userId,
+                                platform,
+                                entitlementId,
+                                isActive,
+                                autoRenewing,
+                                expiresAt,
+                                productId: productId ?? null,
+                                transactionId: transactionId ?? null,
+                                originalTransactionId,
+                                customerInfo: customerInfo ?? null,
+                                lastSource: "revenuecat_client_sync",
+                                lastSyncedAt: now,
+                                updatedAt: now,
+                            },
+                        });
+
+                    await tx
+                        .update(users)
+                        .set({
+                            isLicensed: normalizedIsLicensed,
+                            updatedAt: now,
+                        })
+                        .where(eq(users.id, userId));
+                });
+            } catch (error) {
+                if (error instanceof EntitlementOwnedByAnotherUserError) {
+                    return reply.status(409).send({
+                        code: "ENTITLEMENT_OWNED_BY_ANOTHER_USER",
+                        message: error.message,
+                    });
+                }
+
+                throw error;
+            }
+
+            const normalizedLicense = await getNormalizedLicenseState(app, userId);
 
             return {
                 ok: true as const,
                 data: {
-                    isLicensed: normalizedIsLicensed,
-                    expiresAt: expiresAt ? expiresAt.toISOString() : null,
+                    isLicensed: normalizedLicense.isLicensed,
+                    expiresAt: normalizedLicense.expiresAt,
                 },
             };
         }
@@ -306,132 +689,7 @@ export const licenseRoutes: FastifyPluginAsyncZod = async (app) => {
             },
         },
         async (req) => {
-            const [user] = await app.db.select().from(users).where(eq(users.id, req.authUser!.sub)).limit(1);
-            if (!user) {
-                return {
-                    isLicensed: false,
-                    expiresAt: null,
-                    provider: null,
-                    providerStatus: null,
-                    autoRenewing: null,
-                    license: null,
-                    activations: [],
-                };
-            }
-
-            const [revenuecatSubscription] = await app.db
-                .select()
-                .from(revenuecatSubscriptions)
-                .where(eq(revenuecatSubscriptions.userId, user.id))
-                .limit(1);
-
-            const [stripeSubscription] = await app.db
-                .select()
-                .from(stripeSubscriptions)
-                .where(eq(stripeSubscriptions.userId, user.id))
-                .orderBy(desc(stripeSubscriptions.updatedAt))
-                .limit(1);
-
-            const revenuecatIsLicensed = revenuecatSubscription
-                ? isRevenuecatLicenseActive(revenuecatSubscription.isActive, revenuecatSubscription.expiresAt)
-                : false;
-            const stripeIsLicensed = stripeSubscription
-                ? isStripeLicenseActive(stripeSubscription.status, stripeSubscription.currentPeriodEnd)
-                : false;
-
-            if (!user.licenseId) {
-                const provider: "stripe" | "revenuecat" | null = stripeIsLicensed
-                    ? "stripe"
-                    : revenuecatIsLicensed
-                        ? "revenuecat"
-                        : null;
-                const providerStatus = stripeIsLicensed
-                    ? stripeSubscription?.providerStatus ?? stripeSubscription?.status ?? null
-                    : revenuecatSubscription
-                        ? (revenuecatSubscription.isActive ? "active" : "inactive")
-                        : null;
-                const autoRenewing = stripeIsLicensed
-                    ? stripeSubscription?.autoRenewing ?? null
-                    : revenuecatSubscription?.autoRenewing ?? null;
-                const expiresAt = stripeIsLicensed
-                    ? stripeSubscription?.currentPeriodEnd?.toISOString() ?? null
-                    : revenuecatSubscription?.expiresAt?.toISOString() ?? null;
-
-                return {
-                    isLicensed: stripeIsLicensed || revenuecatIsLicensed,
-                    expiresAt,
-                    provider,
-                    providerStatus,
-                    autoRenewing,
-                    license: null,
-                    activations: [],
-                };
-            }
-
-            const [license] = await app.db.select().from(licenses).where(eq(licenses.id, user.licenseId)).limit(1);
-            const enterpriseIsLicensed = license
-                ? isEnterpriseLicenseActive(license.isActive, license.expiresAt)
-                : false;
-
-            if (!license) {
-                const provider: "stripe" | "revenuecat" | null = stripeIsLicensed
-                    ? "stripe"
-                    : revenuecatIsLicensed
-                        ? "revenuecat"
-                        : null;
-                const providerStatus = stripeIsLicensed
-                    ? stripeSubscription?.providerStatus ?? stripeSubscription?.status ?? null
-                    : revenuecatSubscription
-                        ? (revenuecatSubscription.isActive ? "active" : "inactive")
-                        : null;
-                const autoRenewing = stripeIsLicensed
-                    ? stripeSubscription?.autoRenewing ?? null
-                    : revenuecatSubscription?.autoRenewing ?? null;
-                const expiresAt = stripeIsLicensed
-                    ? stripeSubscription?.currentPeriodEnd?.toISOString() ?? null
-                    : revenuecatSubscription?.expiresAt?.toISOString() ?? null;
-
-                return {
-                    isLicensed: stripeIsLicensed || revenuecatIsLicensed,
-                    expiresAt,
-                    provider,
-                    providerStatus,
-                    autoRenewing,
-                    license: null,
-                    activations: [],
-                };
-            }
-
-            const activationRows = await app.db
-                .select()
-                .from(licenseActivations)
-                .where(and(eq(licenseActivations.userId, user.id), eq(licenseActivations.licenseId, license.id)))
-                .orderBy(desc(licenseActivations.activatedAt));
-
-            const hasActivationForUser = activationRows.length > 0;
-            const normalizedEnterpriseLicense = enterpriseIsLicensed && hasActivationForUser;
-
-            return {
-                isLicensed: normalizedEnterpriseLicense,
-                expiresAt: license.expiresAt?.toISOString() ?? null,
-                provider: "enterprise" as const,
-                providerStatus: normalizedEnterpriseLicense ? "active" : "inactive",
-                autoRenewing: null,
-                license: {
-                    id: license.id,
-                    organizationName: license.organizationName,
-                    allowedEmailDomain: license.allowedEmailDomain,
-                    maxActivations: license.maxActivations,
-                    expiresAt: license.expiresAt?.toISOString() ?? null,
-                    isActive: license.isActive,
-                },
-                activations: activationRows.map((row) => ({
-                    id: row.id,
-                    deviceId: row.deviceId,
-                    platform: row.platform,
-                    activatedAt: row.activatedAt.toISOString(),
-                })),
-            };
+            return getNormalizedLicenseState(app, req.authUser!.sub);
         }
     );
 };

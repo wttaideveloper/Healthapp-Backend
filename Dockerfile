@@ -12,7 +12,7 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.json drizzle.config.ts ./
 COPY src ./src
 COPY migrations ./migrations
-COPY scripts/docker-entrypoint.sh ./scripts/docker-entrypoint.sh
+COPY scripts ./scripts
 
 EXPOSE 8091
 

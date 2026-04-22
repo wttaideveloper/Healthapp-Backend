@@ -7,6 +7,7 @@ import { passwordResets } from "./password-resets";
 import { licenses } from "./licenses";
 import { licenseActivations } from "./license-activations";
 import { revenuecatSubscriptions } from "./revenuecat-subscriptions";
+import { storeEntitlements } from "./store-entitlements";
 import { stripeCustomers } from "./stripe-customers";
 import { stripeSubscriptions } from "./stripe-subscriptions";
 
@@ -25,6 +26,8 @@ export const userRelations = relations(users, ({ many, one }) => ({
         fields: [users.id],
         references: [revenuecatSubscriptions.userId],
     }),
+
+    storeEntitlements: many(storeEntitlements),
 
     stripeCustomer: one(stripeCustomers, {
         fields: [users.id],
@@ -80,6 +83,16 @@ export const revenuecatSubscriptionRelations = relations(
     ({ one }) => ({
         user: one(users, {
             fields: [revenuecatSubscriptions.userId],
+            references: [users.id],
+        }),
+    })
+);
+
+export const storeEntitlementRelations = relations(
+    storeEntitlements,
+    ({ one }) => ({
+        user: one(users, {
+            fields: [storeEntitlements.ownerUserId],
             references: [users.id],
         }),
     })

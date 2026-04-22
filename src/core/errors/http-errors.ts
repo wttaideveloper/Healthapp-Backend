@@ -51,3 +51,13 @@ export class ConflictError extends AppError {
         });
     }
 }
+
+export class EntitlementOwnedByAnotherUserError extends AppError {
+    constructor(message = "This store subscription is already linked to another account.") {
+        super({
+            statusCode: 409,
+            code: "ENTITLEMENT_OWNED_BY_ANOTHER_USER",
+            message,
+        });
+    }
+}

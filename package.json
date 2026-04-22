@@ -14,6 +14,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "dotenv -e .env -- drizzle-kit studio",
+    "entitlements:cleanup": "tsx scripts/reconcile-store-entitlements.ts",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:restart": "docker compose down && docker compose up -d --build",
