@@ -33,7 +33,7 @@ services:
       RUN_MIGRATIONS: "true"
       NODE_ENV: production
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8091/api/v1/health/ready >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8091/api/v1/health/ready >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5

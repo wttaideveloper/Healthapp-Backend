@@ -4,7 +4,6 @@ import {
     UserId,
     UserStatus,
     UserRole,
-    LicenseId,
 } from "./user.domain";
 
 import { SelectUser, users } from "../../db/schema/users";
@@ -66,19 +65,6 @@ export function createUserRepository({ db }: { db: DB }) {
                 .set({
                     isEmailVerified: true,
                     status: "active",
-                })
-                .where(eq(users.id, id));
-        },
-
-        async assignLicense(
-            id: UserId,
-            licenseId: LicenseId
-        ): Promise<void> {
-            await db
-                .update(users)
-                .set({
-                    licenseId,
-                    isLicensed: true,
                 })
                 .where(eq(users.id, id));
         },

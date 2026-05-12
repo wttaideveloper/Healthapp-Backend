@@ -8,6 +8,7 @@ import { passwordResets, users } from "@db/schema";
 import { BadRequestError, ConflictError, UnauthorizedError } from "@core/errors/http-errors";
 import { hashPassword, verifyPassword } from "@core/security/password";
 import { env } from "@config/env";
+import { getEntitlementState, linkWorkspaceMembershipsForUser } from "@modules/entitlement/entitlement.service";
 
 const registerBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -27,7 +28,7 @@ const authResponseSchema = z.object({
         name: z.string(),
         email: z.string().email(),
         role: z.enum(["user", "admin"]),
-        isLicensed: z.boolean(),
+        hasAccess: z.boolean(),
         isEmailVerified: z.boolean(),
         status: z.enum(["pending", "active"]),
     }),
@@ -61,10 +62,14 @@ const meResponseSchema = z.object({
     name: z.string(),
     email: z.string().email(),
     role: z.enum(["user", "admin"]),
-    isLicensed: z.boolean(),
+    hasAccess: z.boolean(),
     isEmailVerified: z.boolean(),
     status: z.enum(["pending", "active"]),
-    licenseId: z.string().uuid().nullable(),
+    entitlement: z.object({
+        source: z.enum(["workspace", "individual_iap", "individual_stripe"]).nullable(),
+        expiresAt: z.string().datetime().nullable(),
+        providerStatus: z.string().nullable(),
+    }),
 });
 
 function sanitizeEmail(email: string): string {
@@ -137,6 +142,8 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                 role: newUser.role,
                 email: newUser.email,
             });
+            await linkWorkspaceMembershipsForUser(app, newUser);
+            const entitlement = await getEntitlementState(app, newUser.id);
 
             return reply.status(201).send({
                 accessToken,
@@ -145,7 +152,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                     name: newUser.name,
                     email: newUser.email,
                     role: newUser.role,
-                    isLicensed: newUser.isLicensed,
+                    hasAccess: entitlement.hasAccess,
                     isEmailVerified: newUser.isEmailVerified,
                     status: newUser.status,
                 },
@@ -304,6 +311,8 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                 role: foundUser.role,
                 email: foundUser.email,
             });
+            await linkWorkspaceMembershipsForUser(app, foundUser);
+            const entitlement = await getEntitlementState(app, foundUser.id);
 
             return {
                 accessToken,
@@ -312,7 +321,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                     name: foundUser.name,
                     email: foundUser.email,
                     role: foundUser.role,
-                    isLicensed: foundUser.isLicensed,
+                    hasAccess: entitlement.hasAccess,
                     isEmailVerified: foundUser.isEmailVerified,
                     status: foundUser.status,
                 },
@@ -341,16 +350,22 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
             if (!foundUser) {
                 throw new UnauthorizedError("Authenticated user not found");
             }
+            await linkWorkspaceMembershipsForUser(app, foundUser);
+            const entitlement = await getEntitlementState(app, foundUser.id);
 
             return {
                 id: foundUser.id,
                 name: foundUser.name,
                 email: foundUser.email,
                 role: foundUser.role,
-                isLicensed: foundUser.isLicensed,
+                hasAccess: entitlement.hasAccess,
                 isEmailVerified: foundUser.isEmailVerified,
                 status: foundUser.status,
-                licenseId: foundUser.licenseId,
+                entitlement: {
+                    source: entitlement.source,
+                    expiresAt: entitlement.expiresAt,
+                    providerStatus: entitlement.providerStatus,
+                },
             };
         }
     );

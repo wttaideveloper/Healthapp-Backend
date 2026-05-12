@@ -12,10 +12,11 @@ import { dbPlugin } from "@plugins/db.plugin";
 import { authPlugin } from "@plugins/auth.plugin";
 import { healthRoutes } from "./modules/health/health.route";
 import { authRoutes } from "./modules/auth/auth.route";
-import { licenseRoutes } from "./modules/license/license.route";
+import { entitlementRoutes } from "./modules/entitlement/entitlement.route";
 import { stripeRoutes } from "./modules/stripe/stripe.route";
-import { adminLicenseRoutes } from "./modules/admin/admin-license.route";
 import { adminUserRoutes } from "./modules/admin/admin-user.route";
+import { adminWorkspaceRoutes } from "./modules/admin/admin-workspace.route";
+import { workspaceRoutes } from "./modules/workspace/workspace.route";
 
 export async function buildApp(): Promise<FastifyInstance> {
     const app = Fastify({
@@ -72,10 +73,11 @@ export async function buildApp(): Promise<FastifyInstance> {
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
     typedApp.register(healthRoutes, { prefix: '/api/v1/health' });
     typedApp.register(authRoutes, { prefix: "/api/v1/auth" });
-    typedApp.register(licenseRoutes, { prefix: "/api/v1/licenses" });
+    typedApp.register(entitlementRoutes, { prefix: "/api/v1/entitlements" });
+    typedApp.register(workspaceRoutes, { prefix: "/api/v1/workspaces" });
     typedApp.register(stripeRoutes, { prefix: "/api/v1/stripe" });
-    typedApp.register(adminLicenseRoutes, { prefix: "/api/v1/admin" });
     typedApp.register(adminUserRoutes, { prefix: "/api/v1/admin" });
+    typedApp.register(adminWorkspaceRoutes, { prefix: "/api/v1/admin" });
 
     return app;
 }

@@ -36,6 +36,13 @@
       "when": 1776841780890,
       "tag": "0005_married_agent_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1778112000000,
+      "tag": "0006_workspace_entitlements",
+      "breakpoints": true
     }
   ]
 }

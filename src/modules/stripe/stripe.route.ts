@@ -56,7 +56,6 @@ function resolvePortalReturnUrl(inputReturnUrl?: string): string {
 }
 
 function computeStripeLicenseState(status: string, currentPeriodEnd: Date | null): {
-    isLicensed: boolean;
     providerStatus: string;
     autoRenewing: boolean;
     expiresAt: Date | null;
@@ -65,7 +64,6 @@ function computeStripeLicenseState(status: string, currentPeriodEnd: Date | null
     const isNotExpired = !currentPeriodEnd || currentPeriodEnd.getTime() > Date.now();
 
     return {
-        isLicensed: isActiveByStatus && isNotExpired,
         providerStatus: status,
         autoRenewing: status !== "canceled",
         expiresAt: currentPeriodEnd,
@@ -364,14 +362,6 @@ export const stripeRoutes: FastifyPluginAsyncZod = async (app) => {
                                 updatedAt: now,
                             },
                         });
-
-                    await tx
-                        .update(users)
-                        .set({
-                            isLicensed: state.isLicensed,
-                            updatedAt: now,
-                        })
-                        .where(eq(users.id, normalized.userId));
                 };
 
                 const resolveAndApplySubscription = async (subscriptionId: string) => {

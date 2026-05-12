@@ -6,6 +6,7 @@ import { env } from "@config/env";
 import { users } from "@db/schema";
 import { ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
 import { hashPassword } from "@core/security/password";
+import { getEntitlementState } from "@modules/entitlement/entitlement.service";
 
 const createAdminBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -108,9 +109,8 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                             email: z.string().email(),
                             role: z.enum(["user", "admin"]),
                             status: z.enum(["pending", "active"]),
-                            isLicensed: z.boolean(),
+                            hasAccess: z.boolean(),
                             isEmailVerified: z.boolean(),
-                            licenseId: z.string().uuid().nullable(),
                             createdAt: z.string().datetime(),
                         })
                     ),
@@ -120,17 +120,21 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
         async () => {
             const rows = await app.db.select().from(users).orderBy(desc(users.createdAt));
 
-            return rows.map((row) => ({
-                id: row.id,
-                name: row.name,
-                email: row.email,
-                role: row.role,
-                status: row.status,
-                isLicensed: row.isLicensed,
-                isEmailVerified: row.isEmailVerified,
-                licenseId: row.licenseId,
-                createdAt: row.createdAt.toISOString(),
-            }));
+            return Promise.all(
+                rows.map(async (row) => {
+                    const entitlement = await getEntitlementState(app, row.id);
+                    return {
+                        id: row.id,
+                        name: row.name,
+                        email: row.email,
+                        role: row.role,
+                        status: row.status,
+                        hasAccess: entitlement.hasAccess,
+                        isEmailVerified: row.isEmailVerified,
+                        createdAt: row.createdAt.toISOString(),
+                    };
+                })
+            );
         }
     );
 

@@ -16,7 +16,7 @@ export const getUserSchema = {
             email: z.email(),
             isEmailVerified: z.boolean(),
             role: roleEnum,
-            isLicensed: z.boolean(),
+            hasAccess: z.boolean(),
         }),
     },
 };

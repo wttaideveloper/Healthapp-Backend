@@ -1,7 +1,6 @@
 import { pgTable, text, uuid, boolean } from "drizzle-orm/pg-core";
 import { userStatusEnum, userRoleEnum } from "./enums";
 import { timestamps } from "./timestamps";
-import { licenses } from "./licenses";
 
 export const users = pgTable("users", {
     id: uuid("id").defaultRandom().primaryKey(),
@@ -23,12 +22,6 @@ export const users = pgTable("users", {
     status: userStatusEnum("status")
         .default("pending")
         .notNull(),
-
-    isLicensed: boolean("is_licensed").default(false).notNull(),
-
-    licenseId: uuid("license_id").references(() => licenses.id, {
-        onDelete: "set null",
-    }),
 
     ...timestamps,
 });

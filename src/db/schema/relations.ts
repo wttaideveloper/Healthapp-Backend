@@ -4,23 +4,16 @@ import { relations } from "drizzle-orm";
 
 import { emailVerifications } from "./email-verifications";
 import { passwordResets } from "./password-resets";
-import { licenses } from "./licenses";
-import { licenseActivations } from "./license-activations";
 import { revenuecatSubscriptions } from "./revenuecat-subscriptions";
 import { storeEntitlements } from "./store-entitlements";
 import { stripeCustomers } from "./stripe-customers";
 import { stripeSubscriptions } from "./stripe-subscriptions";
+import { workspaces } from "./workspaces";
+import { workspaceMembers } from "./workspace-members";
 
 export const userRelations = relations(users, ({ many, one }) => ({
     emailVerifications: many(emailVerifications),
     passwordResets: many(passwordResets),
-
-    license: one(licenses, {
-        fields: [users.licenseId],
-        references: [licenses.id],
-    }),
-
-    licenseActivations: many(licenseActivations),
 
     revenuecatSubscription: one(revenuecatSubscriptions, {
         fields: [users.id],
@@ -35,6 +28,9 @@ export const userRelations = relations(users, ({ many, one }) => ({
     }),
 
     stripeSubscriptions: many(stripeSubscriptions),
+
+    ownedWorkspaces: many(workspaces),
+    workspaceMemberships: many(workspaceMembers),
 }));
 
 export const emailVerificationRelations = relations(
@@ -53,27 +49,6 @@ export const passwordResetRelations = relations(
         user: one(users, {
             fields: [passwordResets.userId],
             references: [users.id],
-        }),
-    })
-);
-
-
-export const licenseRelations = relations(licenses, ({ many }) => ({
-    users: many(users),
-    activations: many(licenseActivations),
-}));
-
-export const licenseActivationRelations = relations(
-    licenseActivations,
-    ({ one }) => ({
-        user: one(users, {
-            fields: [licenseActivations.userId],
-            references: [users.id],
-        }),
-
-        license: one(licenses, {
-            fields: [licenseActivations.licenseId],
-            references: [licenses.id],
         }),
     })
 );
@@ -117,3 +92,30 @@ export const stripeSubscriptionRelations = relations(
         }),
     })
 );
+
+export const workspaceRelations = relations(workspaces, ({ one, many }) => ({
+    owner: one(users, {
+        fields: [workspaces.ownerUserId],
+        references: [users.id],
+    }),
+    createdBy: one(users, {
+        fields: [workspaces.createdByUserId],
+        references: [users.id],
+    }),
+    members: many(workspaceMembers),
+}));
+
+export const workspaceMemberRelations = relations(workspaceMembers, ({ one }) => ({
+    workspace: one(workspaces, {
+        fields: [workspaceMembers.workspaceId],
+        references: [workspaces.id],
+    }),
+    user: one(users, {
+        fields: [workspaceMembers.userId],
+        references: [users.id],
+    }),
+    invitedBy: one(users, {
+        fields: [workspaceMembers.invitedByUserId],
+        references: [users.id],
+    }),
+}));
