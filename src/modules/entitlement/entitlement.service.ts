@@ -47,6 +47,7 @@ export async function linkWorkspaceMembershipsForUser(
 ): Promise<void> {
     const now = new Date();
 
+    // Workspace invites are email-first, so account creation/login claims pending seats.
     await app.db
         .update(workspaceMembers)
         .set({
@@ -69,6 +70,7 @@ export async function linkWorkspaceMembershipsForUser(
 export async function getEntitlementState(app: FastifyInstance, userId: string): Promise<EntitlementState> {
     const now = new Date();
 
+    // Workspace access wins over individual purchases so organization users never see paywalls.
     const [workspaceAccess] = await app.db
         .select({
             workspaceId: workspaces.id,
@@ -115,6 +117,7 @@ export async function getEntitlementState(app: FastifyInstance, userId: string):
         };
     }
 
+    // Individual access can come from App Store/Play Store via RevenueCat or standalone/web via Stripe.
     const [storeEntitlement, stripeSubscription, revenuecatSubscription] = await Promise.all([
         app.db
             .select()

@@ -17,6 +17,7 @@ export function isWorkspaceAccessActive(input: {
     subscriptionStatus: string;
     expiresAt: Date | null;
 }): boolean {
+    // Past-due/canceled workspaces remain visible to admins, but they should not unlock Pro access.
     const activeSubscriptionStatuses = new Set(["active", "trialing"]);
     if (input.workspaceStatus !== "active") return false;
     if (!activeSubscriptionStatuses.has(input.subscriptionStatus)) return false;

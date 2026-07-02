@@ -108,7 +108,7 @@ async function getOrCreateStripeCustomerId(
 }
 
 type SubscriptionUpsertInput = {
-    userId: string;
+    userId: string | null;
     stripeCustomerId: string;
     stripeSubscriptionId: string;
     priceId: string | null;
@@ -124,8 +124,7 @@ function normalizeStripeSubscription(subscription: Stripe.Subscription): Subscri
     const stripeCustomerId = typeof subscription.customer === "string" ? subscription.customer : subscription.customer?.id;
     if (!stripeCustomerId) return null;
 
-    const userId = subscription.metadata?.userId;
-    if (!userId) return null;
+    const userId = subscription.metadata?.userId ?? null;
 
     const firstItem = subscription.items?.data?.[0];
     const priceId = firstItem?.price?.id ?? null;
@@ -312,10 +311,29 @@ export const stripeRoutes: FastifyPluginAsyncZod = async (app) => {
                         return;
                     }
 
+                    let resolvedUserId = normalized.userId;
+                    if (!resolvedUserId) {
+                        // Some Stripe subscription events arrive without copied metadata; customer mapping is the durable fallback.
+                        const [mappedCustomer] = await tx
+                            .select({ userId: stripeCustomers.userId })
+                            .from(stripeCustomers)
+                            .where(eq(stripeCustomers.stripeCustomerId, normalized.stripeCustomerId))
+                            .limit(1);
+                        resolvedUserId = mappedCustomer?.userId ?? null;
+                    }
+
+                    if (!resolvedUserId) {
+                        req.log.warn(
+                            { subscriptionId: subscription.id, stripeCustomerId: normalized.stripeCustomerId },
+                            "Skipping Stripe subscription update: unable to resolve user mapping"
+                        );
+                        return;
+                    }
+
                     await tx
                         .insert(stripeCustomers)
                         .values({
-                            userId: normalized.userId,
+                            userId: resolvedUserId,
                             stripeCustomerId: normalized.stripeCustomerId,
                         })
                         .onConflictDoUpdate({
@@ -332,7 +350,7 @@ export const stripeRoutes: FastifyPluginAsyncZod = async (app) => {
                     await tx
                         .insert(stripeSubscriptions)
                         .values({
-                            userId: normalized.userId,
+                            userId: resolvedUserId,
                             stripeCustomerId: normalized.stripeCustomerId,
                             stripeSubscriptionId: normalized.stripeSubscriptionId,
                             priceId: normalized.priceId,
@@ -348,7 +366,7 @@ export const stripeRoutes: FastifyPluginAsyncZod = async (app) => {
                         .onConflictDoUpdate({
                             target: stripeSubscriptions.stripeSubscriptionId,
                             set: {
-                                userId: normalized.userId,
+                                userId: resolvedUserId,
                                 stripeCustomerId: normalized.stripeCustomerId,
                                 priceId: normalized.priceId,
                                 status: normalized.status,

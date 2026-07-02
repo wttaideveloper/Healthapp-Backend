@@ -87,6 +87,53 @@ const memberResponseSchema = z.object({
     updatedAt: z.string().datetime(),
 });
 
+function inferDisplayName(email: string, explicitName?: string | null): string {
+    if (explicitName && explicitName.trim().length > 0) return explicitName.trim();
+    const localPart = email.split("@")[0] ?? "User";
+    return localPart || "User";
+}
+
+function getWorkspaceInviteEmailContent(input: {
+    organizationName: string;
+    userName: string;
+    userEmail: string;
+    isOwner: boolean;
+}) {
+    const subject = input.isOwner
+        ? `You’ve Been Added as Workspace Admin to ${input.organizationName}’s “Discover your health age” App Pro Account`
+        : `You’ve Been Added to ${input.organizationName}’s “Discover your health age” App’s Pro Account`;
+
+    const introRoleLine = input.isOwner
+        ? "You have been added as the workspace administrator for your organization."
+        : "Your organization administrator has granted you access to premium features as part of your organization’s subscription.";
+
+    const text = `Hello ${input.userName},
+
+You’ve been added to the Pro account for ${input.organizationName} on “Discover your health age” App.
+${introRoleLine}
+
+To get started:
+1. Visit: https://health-age-admin.vercel.app/workspace-admin
+2. Download the app for your device (iPhone, Android, Windows, or Mac)
+3. Sign in using this email address: ${input.userEmail}
+4. If you don’t already have an account, create one using this email address
+5. Your Pro access will automatically be activated after login`;
+
+    const html = `<p>Hello ${input.userName},</p>
+<p>You’ve been added to the Pro account for <strong>${input.organizationName}</strong> on “Discover your health age” App.</p>
+<p>${introRoleLine}</p>
+<p>To get started:</p>
+<ol>
+<li>Visit: <a href="https://health-age-admin.vercel.app/workspace-admin">https://health-age-admin.vercel.app/workspace-admin</a></li>
+<li>Download the app for your device (iPhone, Android, Windows, or Mac)</li>
+<li>Sign in using this email address: <strong>${input.userEmail}</strong></li>
+<li>If you don’t already have an account, create one using this email address</li>
+<li>Your Pro access will automatically be activated after login</li>
+</ol>`;
+
+    return { subject, text, html };
+}
+
 function serializeWorkspace(row: typeof workspaces.$inferSelect, activeSeatCount: number) {
     return {
         id: row.id,
@@ -134,7 +181,7 @@ async function getActiveSeatCount(app: Parameters<FastifyPluginAsyncZod>[0], wor
 
 async function findUserByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email: string) {
     return app.db
-        .select({ id: users.id })
+        .select({ id: users.id, name: users.name })
         .from(users)
         .where(eq(users.email, email))
         .limit(1)
@@ -210,15 +257,20 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 return workspace;
             });
 
-            if (!existingUser) {
-                await smtpTransport.sendMail({
-                    from: env.EMAIL_FROM ?? env.SMTP_USER,
-                    to: ownerEmail,
-                    subject: "You have been invited to a HealthAge workspace",
-                    text: `You were added as workspace owner for "${createdWorkspace.name}". Sign up or log in with this email to access it.`,
-                    html: `<p>You were added as workspace owner for <strong>${createdWorkspace.name}</strong>.</p><p>Sign up or log in with this email to access it.</p>`,
-                });
-            }
+            const ownerMail = getWorkspaceInviteEmailContent({
+                organizationName: createdWorkspace.name,
+                userName: inferDisplayName(ownerEmail, existingUser?.name),
+                userEmail: ownerEmail,
+                isOwner: true,
+            });
+
+            await smtpTransport.sendMail({
+                from: env.EMAIL_FROM ?? env.SMTP_USER,
+                to: ownerEmail,
+                subject: ownerMail.subject,
+                text: ownerMail.text,
+                html: ownerMail.html,
+            });
 
             return reply.status(201).send(serializeWorkspace(createdWorkspace, 1));
         }
@@ -407,6 +459,21 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                     .where(eq(workspaceMembers.id, existingMember.id))
                     .returning();
 
+                const reactivatedMail = getWorkspaceInviteEmailContent({
+                    organizationName: workspace.name,
+                    userName: inferDisplayName(email, existingUser?.name),
+                    userEmail: email,
+                    isOwner: req.body.role === "owner",
+                });
+
+                await smtpTransport.sendMail({
+                    from: env.EMAIL_FROM ?? env.SMTP_USER,
+                    to: email,
+                    subject: reactivatedMail.subject,
+                    text: reactivatedMail.text,
+                    html: reactivatedMail.html,
+                });
+
                 return reply.status(201).send(serializeMember(reactivatedMember));
             }
 
@@ -428,15 +495,20 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 throw new ConflictError("This email is already a member of the workspace");
             }
 
-            if (!existingUser) {
-                await smtpTransport.sendMail({
-                    from: env.EMAIL_FROM ?? env.SMTP_USER,
-                    to: email,
-                    subject: "You have been invited to a HealthAge workspace",
-                    text: `You were invited to "${workspace.name}" as ${req.body.role}. Sign up or log in with this email to access it.`,
-                    html: `<p>You were invited to <strong>${workspace.name}</strong> as <strong>${req.body.role}</strong>.</p><p>Sign up or log in with this email to access it.</p>`,
-                });
-            }
+            const memberMail = getWorkspaceInviteEmailContent({
+                organizationName: workspace.name,
+                userName: inferDisplayName(email, existingUser?.name),
+                userEmail: email,
+                isOwner: req.body.role === "owner",
+            });
+
+            await smtpTransport.sendMail({
+                from: env.EMAIL_FROM ?? env.SMTP_USER,
+                to: email,
+                subject: memberMail.subject,
+                text: memberMail.text,
+                html: memberMail.html,
+            });
 
             return reply.status(201).send(serializeMember(createdMember));
         }

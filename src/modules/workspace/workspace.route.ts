@@ -1,7 +1,9 @@
 import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import nodemailer from "nodemailer";
 import z from "zod";
 
+import { env } from "@config/env";
 import { users, workspaceMembers, workspaces } from "@db/schema";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
 import { normalizeEmail } from "./workspace.util";
@@ -50,6 +52,45 @@ const memberResponseSchema = z.object({
     updatedAt: z.string().datetime(),
 });
 
+function inferDisplayName(email: string, explicitName?: string | null): string {
+    if (explicitName && explicitName.trim().length > 0) return explicitName.trim();
+    const localPart = email.split("@")[0] ?? "User";
+    return localPart || "User";
+}
+
+function getWorkspaceInviteEmailContent(input: {
+    organizationName: string;
+    userName: string;
+    userEmail: string;
+}) {
+    const subject = `You’ve Been Added to ${input.organizationName}’s “Discover your health age” App’s Pro Account`;
+    const text = `Hello ${input.userName},
+
+You’ve been added to the Pro account for ${input.organizationName} on “Discover your health age” App.
+Your organization administrator has granted you access to premium features as part of your organization’s subscription.
+
+To get started:
+1. Visit: https://health-age-admin.vercel.app/workspace-admin
+2. Download the app for your device (iPhone, Android, Windows, or Mac)
+3. Sign in using this email address: ${input.userEmail}
+4. If you don’t already have an account, create one using this email address
+5. Your Pro access will automatically be activated after login`;
+
+    const html = `<p>Hello ${input.userName},</p>
+<p>You’ve been added to the Pro account for <strong>${input.organizationName}</strong> on “Discover your health age” App.</p>
+<p>Your organization administrator has granted you access to premium features as part of your organization’s subscription.</p>
+<p>To get started:</p>
+<ol>
+<li>Visit: <a href="https://health-age-admin.vercel.app/workspace-admin">https://health-age-admin.vercel.app/workspace-admin</a></li>
+<li>Download the app for your device (iPhone, Android, Windows, or Mac)</li>
+<li>Sign in using this email address: <strong>${input.userEmail}</strong></li>
+<li>If you don’t already have an account, create one using this email address</li>
+<li>Your Pro access will automatically be activated after login</li>
+</ol>`;
+
+    return { subject, text, html };
+}
+
 function serializeMember(row: typeof workspaceMembers.$inferSelect) {
     return {
         id: row.id,
@@ -77,6 +118,15 @@ async function getActiveSeatCount(app: Parameters<FastifyPluginAsyncZod>[0], wor
 async function findUserIdByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email: string): Promise<string | null> {
     const [user] = await app.db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
     return user?.id ?? null;
+}
+
+async function findUserByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email: string) {
+    return app.db
+        .select({ id: users.id, name: users.name })
+        .from(users)
+        .where(eq(users.email, email))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
 }
 
 async function requireWorkspaceManager(
@@ -112,6 +162,16 @@ async function requireWorkspaceManager(
 }
 
 export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
+    const smtpTransport = nodemailer.createTransport({
+        host: env.SMTP_HOST,
+        port: env.SMTP_PORT,
+        secure: env.SMTP_PORT === 465,
+        auth: {
+            user: env.SMTP_USER,
+            pass: env.SMTP_PASS,
+        },
+    });
+
     app.get(
         "/me",
         {
@@ -206,7 +266,8 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             }
 
             const email = normalizeEmail(req.body.email);
-            const userId = await findUserIdByEmail(app, email);
+            const existingUser = await findUserByEmail(app, email);
+            const userId = existingUser?.id ?? null;
             const now = new Date();
             const [existingMember] = await app.db
                 .select()
@@ -233,6 +294,20 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                     .where(eq(workspaceMembers.id, existingMember.id))
                     .returning();
 
+                const reactivatedMail = getWorkspaceInviteEmailContent({
+                    organizationName: workspace.name,
+                    userName: inferDisplayName(email, existingUser?.name),
+                    userEmail: email,
+                });
+
+                await smtpTransport.sendMail({
+                    from: env.EMAIL_FROM ?? env.SMTP_USER,
+                    to: email,
+                    subject: reactivatedMail.subject,
+                    text: reactivatedMail.text,
+                    html: reactivatedMail.html,
+                });
+
                 return reply.status(201).send(serializeMember(reactivatedMember));
             }
 
@@ -253,6 +328,20 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             if (!createdMember) {
                 throw new ConflictError("This email is already a member of the workspace");
             }
+
+            const inviteMail = getWorkspaceInviteEmailContent({
+                organizationName: workspace.name,
+                userName: inferDisplayName(email, existingUser?.name),
+                userEmail: email,
+            });
+
+            await smtpTransport.sendMail({
+                from: env.EMAIL_FROM ?? env.SMTP_USER,
+                to: email,
+                subject: inviteMail.subject,
+                text: inviteMail.text,
+                html: inviteMail.html,
+            });
 
             return reply.status(201).send(serializeMember(createdMember));
         }
