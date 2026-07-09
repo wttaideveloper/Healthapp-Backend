@@ -17,6 +17,7 @@ import { stripeRoutes } from "./modules/stripe/stripe.route";
 import { adminUserRoutes } from "./modules/admin/admin-user.route";
 import { adminWorkspaceRoutes } from "./modules/admin/admin-workspace.route";
 import { workspaceRoutes } from "./modules/workspace/workspace.route";
+import { legalRoutes } from "./modules/legal/legal.route";
 
 export async function buildApp(): Promise<FastifyInstance> {
     const app = Fastify({
@@ -67,6 +68,9 @@ export async function buildApp(): Promise<FastifyInstance> {
     await app.register(dbLivePlugin);        // app.isDbLive
     await app.register(authPlugin);
     await app.register(errorHandlerPlugin);   // custom error handler
+
+    /* ---------------- PUBLIC LEGAL PAGES ---------------- */
+    await app.register(legalRoutes);
 
     /* ---------------- ROUTES (TYPED) ---------------- */
 
