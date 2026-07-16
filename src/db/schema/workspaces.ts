@@ -1,5 +1,6 @@
 import { boolean, index, integer, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 import { users } from "./users";
+import { shopifyShops } from "./shopify-shops";
 import { timestamps } from "./timestamps";
 
 export const workspaces = pgTable(
@@ -16,6 +17,12 @@ export const workspaces = pgTable(
         expiresAt: timestamp("expires_at", { withTimezone: true }),
         notes: text("notes"),
         isProvisionedExternally: boolean("is_provisioned_externally").default(true).notNull(),
+        /**
+         * How org seats were provisioned.
+         * Expected values: manual | shopify
+         */
+        billingSource: text("billing_source").default("manual").notNull(),
+        shopifyShopId: uuid("shopify_shop_id").references(() => shopifyShops.id, { onDelete: "set null" }),
         createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
         revokedAt: timestamp("revoked_at", { withTimezone: true }),
         ...timestamps,
@@ -24,6 +31,8 @@ export const workspaces = pgTable(
         index("idx_workspaces_status").on(table.status),
         index("idx_workspaces_owner_email").on(table.ownerEmail),
         index("idx_workspaces_expires_at").on(table.expiresAt),
+        index("idx_workspaces_billing_source").on(table.billingSource),
+        index("idx_workspaces_shopify_shop_id").on(table.shopifyShopId),
     ]
 );
 

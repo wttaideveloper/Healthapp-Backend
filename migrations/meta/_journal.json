@@ -43,6 +43,13 @@
       "when": 1778112000000,
       "tag": "0006_workspace_entitlements",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784131200000,
+      "tag": "0007_shopify_licensing",
+      "breakpoints": true
     }
   ]
 }

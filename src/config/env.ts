@@ -19,6 +19,11 @@ const envSchema = z.object({
     STRIPE_SUCCESS_URL: z.url().optional(),
     STRIPE_CANCEL_URL: z.url().optional(),
     STRIPE_BILLING_PORTAL_RETURN_URL: z.url().optional(),
+    SHOPIFY_API_KEY: z.string().min(1).optional(),
+    SHOPIFY_API_SECRET: z.string().min(1).optional(),
+    SHOPIFY_WEBHOOK_SECRET: z.string().min(1).optional(),
+    SHOPIFY_ACCESS_TOKEN: z.string().min(1).optional(),
+    SHOPIFY_SHOP_DOMAIN: z.string().min(1).optional(),
 
 });
 

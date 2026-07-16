@@ -18,6 +18,7 @@ import { adminUserRoutes } from "./modules/admin/admin-user.route";
 import { adminWorkspaceRoutes } from "./modules/admin/admin-workspace.route";
 import { workspaceRoutes } from "./modules/workspace/workspace.route";
 import { legalRoutes } from "./modules/legal/legal.route";
+import { shopifyRoutes } from "./modules/shopify/shopify.route";
 
 export async function buildApp(): Promise<FastifyInstance> {
     const app = Fastify({
@@ -80,6 +81,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     typedApp.register(entitlementRoutes, { prefix: "/api/v1/entitlements" });
     typedApp.register(workspaceRoutes, { prefix: "/api/v1/workspaces" });
     typedApp.register(stripeRoutes, { prefix: "/api/v1/stripe" });
+    typedApp.register(shopifyRoutes, { prefix: "/api/v1/shopify" });
     typedApp.register(adminUserRoutes, { prefix: "/api/v1/admin" });
     typedApp.register(adminWorkspaceRoutes, { prefix: "/api/v1/admin" });
 
