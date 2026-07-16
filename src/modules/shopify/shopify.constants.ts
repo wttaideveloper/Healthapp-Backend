@@ -2,14 +2,15 @@
  * Shopify org-license status vocabulary (app-level; columns are text).
  *
  * Status mapping (commerce → HealthAge workspace):
- * - Shopify order paid / fulfilled     → workspace.subscriptionStatus = active
- * - Shopify subscription active        → workspace.subscriptionStatus = active
- * - Shopify subscription past_due      → workspace.subscriptionStatus = past_due
- * - Refund / cancel / expire           → workspace.subscriptionStatus = canceled | expired
+ * - Shopify order paid                 → workspace.subscriptionStatus = active
+ * - Shopify order cancelled / refunded → workspace.subscriptionStatus = canceled
  * - Seat quantity from order/sub       → workspace.seatLimit
  *
+ * Note: workspace.subscription_status uses American "canceled" (workspace.util).
+ * shopify_orders.status uses Shopify-style "cancelled" / "refunded".
+ *
  * Access continues to resolve via workspaces + GET /api/v1/entitlements/me
- * (source: workspace). Webhook handlers land in a later phase.
+ * (source: workspace). Cancelled/refunded subscriptions fail isWorkspaceAccessActive.
  */
 
 export const workspaceBillingSources = ["manual", "shopify"] as const;

@@ -1,9 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 
 import { env } from "@config/env";
-import { billingEvents, shopifyOrders, shopifyShops, users, workspaceMembers, workspaces } from "@db/schema";
+import { billingEvents, shopifyOrders, shopifyShops, shopifySubscriptions, users, workspaceMembers, workspaces } from "@db/schema";
 import {
     createWorkspaceSmtpTransport,
     getWorkspaceInviteEmailContent,
@@ -25,14 +25,39 @@ export type ShopifyWebhookRecordResult = {
 };
 
 export const SHOPIFY_ORDER_PAID_TOPIC = "orders/paid";
+export const SHOPIFY_ORDER_CANCELLED_TOPIC = "orders/cancelled";
+export const SHOPIFY_REFUND_CREATED_TOPIC = "refunds/create";
 
-export const SHOPIFY_ORDER_WEBHOOK_TOPICS = new Set([
+/** Order topics that upsert order rows (excludes cancel — cancel only updates existing rows). */
+export const SHOPIFY_ORDER_UPSERT_WEBHOOK_TOPICS = new Set([
     "orders/create",
     SHOPIFY_ORDER_PAID_TOPIC,
     "orders/updated",
-    "orders/cancelled",
     "orders/fulfilled",
     "orders/partially_fulfilled",
+]);
+
+export const SHOPIFY_ORDER_WEBHOOK_TOPICS = new Set([
+    ...SHOPIFY_ORDER_UPSERT_WEBHOOK_TOPICS,
+    SHOPIFY_ORDER_CANCELLED_TOPIC,
+]);
+
+export const SHOPIFY_REFUND_WEBHOOK_TOPICS = new Set([SHOPIFY_REFUND_CREATED_TOPIC]);
+
+/** Subscription lifecycle topics. Accepts Shopify's real slugs and the shorthand aliases. */
+export const SHOPIFY_SUBSCRIPTION_CREATED_TOPICS = new Set([
+    "subscription-created",
+    "subscription_contracts/create",
+]);
+
+export const SHOPIFY_SUBSCRIPTION_UPDATED_TOPICS = new Set([
+    "subscription-updated",
+    "subscription_contracts/update",
+]);
+
+export const SHOPIFY_SUBSCRIPTION_CANCELLED_TOPICS = new Set([
+    "subscription-cancelled",
+    "subscription_contracts/cancel",
 ]);
 
 export type ShopifyOrderLineItem = {
@@ -86,6 +111,23 @@ export function isShopifyOrderWebhookTopic(topic: string): boolean {
     return SHOPIFY_ORDER_WEBHOOK_TOPICS.has(topic);
 }
 
+export function isShopifyRefundWebhookTopic(topic: string): boolean {
+    return SHOPIFY_REFUND_WEBHOOK_TOPICS.has(topic);
+}
+
+export type ShopifySubscriptionLifecycle = "created" | "updated" | "cancelled";
+
+export function resolveShopifySubscriptionLifecycle(topic: string): ShopifySubscriptionLifecycle | null {
+    if (SHOPIFY_SUBSCRIPTION_CREATED_TOPICS.has(topic)) return "created";
+    if (SHOPIFY_SUBSCRIPTION_UPDATED_TOPICS.has(topic)) return "updated";
+    if (SHOPIFY_SUBSCRIPTION_CANCELLED_TOPICS.has(topic)) return "cancelled";
+    return null;
+}
+
+export function isShopifySubscriptionWebhookTopic(topic: string): boolean {
+    return resolveShopifySubscriptionLifecycle(topic) !== null;
+}
+
 /**
  * Seat count for a single line item.
  * Uses numeric variant title when present; otherwise falls back to quantity.
@@ -131,6 +173,26 @@ function asNumber(value: unknown): number | null {
         return Number.isFinite(parsed) ? parsed : null;
     }
     return null;
+}
+
+function asDate(value: unknown): Date | null {
+    if (typeof value === "string" && value.trim().length > 0) {
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? null : parsed;
+    }
+    return null;
+}
+
+function extractShopifyOrderIdFromPayload(payload: Record<string, unknown>): string | null {
+    return asString(payload.id) ?? asString(payload.admin_graphql_api_id);
+}
+
+function extractShopifyOrderIdFromRefundPayload(payload: Record<string, unknown>): string | null {
+    return asString(payload.order_id);
 }
 
 function normalizeShopDomain(shopDomain: string): string {
@@ -414,6 +476,180 @@ async function loadShopifyOrderRecord(
     return savedOrder ?? null;
 }
 
+async function findShopifyOrderByShopifyOrderId(
+    db: DbExecutor,
+    shopifyOrderId: string
+): Promise<{
+    id: string;
+    shopifyOrderId: string;
+    workspaceId: string | null;
+    status: string;
+} | null> {
+    const [savedOrder] = await db
+        .select({
+            id: shopifyOrders.id,
+            shopifyOrderId: shopifyOrders.shopifyOrderId,
+            workspaceId: shopifyOrders.workspaceId,
+            status: shopifyOrders.status,
+        })
+        .from(shopifyOrders)
+        .where(eq(shopifyOrders.shopifyOrderId, shopifyOrderId))
+        .limit(1);
+
+    return savedOrder ?? null;
+}
+
+/**
+ * Revokes future workspace access without deleting the workspace or members.
+ * Uses "canceled" to match workspaceSubscriptionStatuses / entitlement checks.
+ */
+async function revokeWorkspaceAccessFromShopifyOrder(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    input: {
+        workspaceId: string;
+        shopifyOrderId: string;
+        reason: "cancelled" | "refunded";
+    }
+): Promise<void> {
+    const now = new Date();
+
+    await db
+        .update(workspaces)
+        .set({
+            subscriptionStatus: "canceled",
+            updatedAt: now,
+        })
+        .where(eq(workspaces.id, input.workspaceId));
+
+    log.info(
+        {
+            workspaceId: input.workspaceId,
+            shopifyOrderId: input.shopifyOrderId,
+            reason: input.reason,
+            subscriptionStatus: "canceled",
+        },
+        "Revoked Shopify workspace access"
+    );
+}
+
+export async function handleShopifyOrderCancelled(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    payload: Record<string, unknown>
+): Promise<void> {
+    const shopifyOrderId = extractShopifyOrderIdFromPayload(payload);
+    if (!shopifyOrderId) {
+        log.warn({ topic: SHOPIFY_ORDER_CANCELLED_TOPIC }, "orders/cancelled webhook missing order id");
+        return;
+    }
+
+    const existingOrder = await findShopifyOrderByShopifyOrderId(db, shopifyOrderId);
+    if (!existingOrder) {
+        log.info(
+            { shopifyOrderId, topic: SHOPIFY_ORDER_CANCELLED_TOPIC },
+            "Ignoring orders/cancelled: Shopify order not found"
+        );
+        return;
+    }
+
+    const now = new Date();
+    const financialStatus = asString(payload.financial_status);
+
+    await db
+        .update(shopifyOrders)
+        .set({
+            status: "cancelled",
+            ...(financialStatus ? { financialStatus } : {}),
+            updatedAt: now,
+        })
+        .where(eq(shopifyOrders.id, existingOrder.id));
+
+    log.info(
+        {
+            shopifyOrderId,
+            shopifyOrderRecordId: existingOrder.id,
+            workspaceId: existingOrder.workspaceId,
+            status: "cancelled",
+        },
+        "Updated Shopify order status to cancelled"
+    );
+
+    if (!existingOrder.workspaceId) {
+        log.info(
+            { shopifyOrderId, shopifyOrderRecordId: existingOrder.id },
+            "orders/cancelled: no linked workspace to revoke"
+        );
+        return;
+    }
+
+    await revokeWorkspaceAccessFromShopifyOrder(db, log, {
+        workspaceId: existingOrder.workspaceId,
+        shopifyOrderId,
+        reason: "cancelled",
+    });
+}
+
+export async function handleShopifyRefundCreated(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    payload: Record<string, unknown>
+): Promise<void> {
+    const shopifyOrderId = extractShopifyOrderIdFromRefundPayload(payload);
+    if (!shopifyOrderId) {
+        log.warn(
+            { topic: SHOPIFY_REFUND_CREATED_TOPIC },
+            "refunds/create webhook missing order_id"
+        );
+        return;
+    }
+
+    const existingOrder = await findShopifyOrderByShopifyOrderId(db, shopifyOrderId);
+    if (!existingOrder) {
+        log.info(
+            { shopifyOrderId, topic: SHOPIFY_REFUND_CREATED_TOPIC },
+            "Ignoring refunds/create: Shopify order not found"
+        );
+        return;
+    }
+
+    const now = new Date();
+
+    await db
+        .update(shopifyOrders)
+        .set({
+            status: "refunded",
+            financialStatus: "refunded",
+            updatedAt: now,
+        })
+        .where(eq(shopifyOrders.id, existingOrder.id));
+
+    log.info(
+        {
+            shopifyOrderId,
+            shopifyOrderRecordId: existingOrder.id,
+            workspaceId: existingOrder.workspaceId,
+            refundId: asString(payload.id),
+            status: "refunded",
+        },
+        "Updated Shopify order status to refunded"
+    );
+
+    if (!existingOrder.workspaceId) {
+        log.info(
+            { shopifyOrderId, shopifyOrderRecordId: existingOrder.id },
+            "refunds/create: no linked workspace to revoke"
+        );
+        return;
+    }
+
+    await revokeWorkspaceAccessFromShopifyOrder(db, log, {
+        workspaceId: existingOrder.workspaceId,
+        shopifyOrderId,
+        reason: "refunded",
+    });
+}
+
 export async function provisionWorkspaceFromShopifyPaidOrder(
     db: DbExecutor,
     log: FastifyBaseLogger,
@@ -626,6 +862,353 @@ export async function processShopifyOrderWebhook(
     return null;
 }
 
+export type ParsedShopifySubscriptionWebhook = {
+    shopifySubscriptionId: string;
+    purchaserEmail: string | null;
+    status: string;
+    currentPeriodEnd: Date | null;
+    expiresAt: Date | null;
+    seatQuantity: number;
+    autoRenewing: boolean;
+    cancelAtPeriodEnd: boolean;
+    payloadJson: Record<string, unknown>;
+};
+
+function resolveSubscriptionSeatQuantity(payload: Record<string, unknown>): number {
+    const lineItems = parseLineItems(payload);
+    if (lineItems.length > 0) {
+        return resolveOrderSeatCount(lineItems);
+    }
+
+    return asNumber(payload.quantity) ?? asNumber(payload.seats) ?? 0;
+}
+
+/** Maps a raw Shopify subscription status onto the workspace subscription vocabulary. */
+function mapShopifySubscriptionToWorkspaceStatus(status: string): string {
+    const normalized = status.trim().toLowerCase();
+    if (["active", "live"].includes(normalized)) return "active";
+    if (["trialing", "trial"].includes(normalized)) return "trialing";
+    if (["past_due", "paused"].includes(normalized)) return "past_due";
+    if (["expired"].includes(normalized)) return "expired";
+    if (["cancelled", "canceled"].includes(normalized)) return "canceled";
+    return "active";
+}
+
+export function parseShopifySubscriptionWebhook(input: {
+    topic: string;
+    payload: Record<string, unknown>;
+}): ParsedShopifySubscriptionWebhook {
+    const shopifySubscriptionId =
+        asString(input.payload.id) ?? asString(input.payload.admin_graphql_api_id);
+    if (!shopifySubscriptionId) {
+        throw new Error("Shopify subscription webhook missing subscription id");
+    }
+
+    const currentPeriodEnd =
+        asDate(input.payload.next_billing_date) ??
+        asDate(input.payload.current_period_end) ??
+        asDate(input.payload.billing_next_date);
+
+    const expiresAt =
+        asDate(input.payload.expires_at) ??
+        asDate(input.payload.end_date) ??
+        currentPeriodEnd;
+
+    const status = asString(input.payload.status) ?? "active";
+    const cancelAtPeriodEnd = input.payload.cancel_at_period_end === true;
+
+    return {
+        shopifySubscriptionId,
+        purchaserEmail: resolvePurchaserEmail(input.payload),
+        status,
+        currentPeriodEnd,
+        expiresAt,
+        seatQuantity: resolveSubscriptionSeatQuantity(input.payload),
+        autoRenewing: mapShopifySubscriptionToWorkspaceStatus(status) === "active" && !cancelAtPeriodEnd,
+        cancelAtPeriodEnd,
+        payloadJson: input.payload,
+    };
+}
+
+async function findShopifySubscriptionBySubscriptionId(
+    db: DbExecutor,
+    shopifySubscriptionId: string
+): Promise<{ id: string; workspaceId: string | null; seatQuantity: number; status: string } | null> {
+    const [existing] = await db
+        .select({
+            id: shopifySubscriptions.id,
+            workspaceId: shopifySubscriptions.workspaceId,
+            seatQuantity: shopifySubscriptions.seatQuantity,
+            status: shopifySubscriptions.status,
+        })
+        .from(shopifySubscriptions)
+        .where(eq(shopifySubscriptions.shopifySubscriptionId, shopifySubscriptionId))
+        .limit(1);
+
+    return existing ?? null;
+}
+
+async function findShopifyWorkspaceIdByOwnerEmail(
+    db: DbExecutor,
+    email: string
+): Promise<string | null> {
+    const [workspace] = await db
+        .select({ id: workspaces.id })
+        .from(workspaces)
+        .where(and(eq(workspaces.ownerEmail, email), eq(workspaces.billingSource, "shopify")))
+        .orderBy(desc(workspaces.updatedAt))
+        .limit(1);
+
+    return workspace?.id ?? null;
+}
+
+export async function handleShopifySubscriptionCreated(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    input: { shopId: string; subscription: ParsedShopifySubscriptionWebhook }
+): Promise<void> {
+    const { subscription } = input;
+
+    const existing = await findShopifySubscriptionBySubscriptionId(db, subscription.shopifySubscriptionId);
+
+    let linkedWorkspaceId = existing?.workspaceId ?? null;
+    if (!linkedWorkspaceId && subscription.purchaserEmail) {
+        linkedWorkspaceId = await findShopifyWorkspaceIdByOwnerEmail(db, subscription.purchaserEmail);
+    }
+
+    const now = new Date();
+    const providerStatus = subscription.status;
+
+    await db
+        .insert(shopifySubscriptions)
+        .values({
+            shopId: input.shopId,
+            workspaceId: linkedWorkspaceId,
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            status: subscription.status,
+            seatQuantity: subscription.seatQuantity,
+            currentPeriodEnd: subscription.currentPeriodEnd,
+            cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+            providerStatus,
+            autoRenewing: subscription.autoRenewing,
+            payloadJson: subscription.payloadJson,
+        })
+        .onConflictDoUpdate({
+            target: shopifySubscriptions.shopifySubscriptionId,
+            set: {
+                workspaceId: linkedWorkspaceId,
+                status: subscription.status,
+                seatQuantity: subscription.seatQuantity,
+                currentPeriodEnd: subscription.currentPeriodEnd,
+                cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+                providerStatus,
+                autoRenewing: subscription.autoRenewing,
+                payloadJson: subscription.payloadJson,
+                updatedAt: now,
+            },
+        });
+
+    log.info(
+        {
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            workspaceId: linkedWorkspaceId,
+            status: subscription.status,
+            seatQuantity: subscription.seatQuantity,
+            currentPeriodEnd: subscription.currentPeriodEnd?.toISOString() ?? null,
+            expiresAt: subscription.expiresAt?.toISOString() ?? null,
+        },
+        "Shopify subscription created"
+    );
+
+    if (!linkedWorkspaceId) {
+        return;
+    }
+
+    await db
+        .update(workspaces)
+        .set({
+            subscriptionStatus: "active",
+            ...(subscription.expiresAt ? { expiresAt: subscription.expiresAt } : {}),
+            updatedAt: now,
+        })
+        .where(eq(workspaces.id, linkedWorkspaceId));
+
+    log.info(
+        {
+            workspaceId: linkedWorkspaceId,
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            subscriptionStatus: "active",
+            expiresAt: subscription.expiresAt?.toISOString() ?? null,
+        },
+        "Workspace updated from Shopify subscription created"
+    );
+}
+
+export async function handleShopifySubscriptionUpdated(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    input: { subscription: ParsedShopifySubscriptionWebhook }
+): Promise<void> {
+    const { subscription } = input;
+
+    const existing = await findShopifySubscriptionBySubscriptionId(db, subscription.shopifySubscriptionId);
+    if (!existing) {
+        log.warn(
+            { shopifySubscriptionId: subscription.shopifySubscriptionId },
+            "Shopify subscription not found for update"
+        );
+        return;
+    }
+
+    const now = new Date();
+    const seatChanged = subscription.seatQuantity > 0 && subscription.seatQuantity !== existing.seatQuantity;
+
+    await db
+        .update(shopifySubscriptions)
+        .set({
+            status: subscription.status,
+            seatQuantity: seatChanged ? subscription.seatQuantity : existing.seatQuantity,
+            currentPeriodEnd: subscription.currentPeriodEnd,
+            cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+            providerStatus: subscription.status,
+            autoRenewing: subscription.autoRenewing,
+            payloadJson: subscription.payloadJson,
+            updatedAt: now,
+        })
+        .where(eq(shopifySubscriptions.id, existing.id));
+
+    log.info(
+        {
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            workspaceId: existing.workspaceId,
+            status: subscription.status,
+            seatQuantity: seatChanged ? subscription.seatQuantity : existing.seatQuantity,
+            seatChanged,
+            currentPeriodEnd: subscription.currentPeriodEnd?.toISOString() ?? null,
+            expiresAt: subscription.expiresAt?.toISOString() ?? null,
+        },
+        "Shopify subscription updated"
+    );
+
+    if (!existing.workspaceId) {
+        return;
+    }
+
+    await db
+        .update(workspaces)
+        .set({
+            subscriptionStatus: mapShopifySubscriptionToWorkspaceStatus(subscription.status),
+            ...(seatChanged ? { seatLimit: subscription.seatQuantity } : {}),
+            ...(subscription.expiresAt ? { expiresAt: subscription.expiresAt } : {}),
+            updatedAt: now,
+        })
+        .where(eq(workspaces.id, existing.workspaceId));
+
+    log.info(
+        {
+            workspaceId: existing.workspaceId,
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            subscriptionStatus: mapShopifySubscriptionToWorkspaceStatus(subscription.status),
+            seatLimit: seatChanged ? subscription.seatQuantity : undefined,
+            expiresAt: subscription.expiresAt?.toISOString() ?? null,
+        },
+        "Workspace updated from Shopify subscription updated"
+    );
+}
+
+export async function handleShopifySubscriptionCancelled(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    input: { subscription: ParsedShopifySubscriptionWebhook }
+): Promise<void> {
+    const { subscription } = input;
+
+    const existing = await findShopifySubscriptionBySubscriptionId(db, subscription.shopifySubscriptionId);
+    if (!existing) {
+        log.warn(
+            { shopifySubscriptionId: subscription.shopifySubscriptionId },
+            "Shopify subscription not found for cancellation"
+        );
+        return;
+    }
+
+    const now = new Date();
+
+    await db
+        .update(shopifySubscriptions)
+        .set({
+            status: "cancelled",
+            providerStatus: subscription.status,
+            cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+            autoRenewing: false,
+            payloadJson: subscription.payloadJson,
+            updatedAt: now,
+        })
+        .where(eq(shopifySubscriptions.id, existing.id));
+
+    log.info(
+        {
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            workspaceId: existing.workspaceId,
+            status: "cancelled",
+        },
+        "Shopify subscription cancelled"
+    );
+
+    if (!existing.workspaceId) {
+        return;
+    }
+
+    await db
+        .update(workspaces)
+        .set({
+            subscriptionStatus: "canceled",
+            updatedAt: now,
+        })
+        .where(eq(workspaces.id, existing.workspaceId));
+
+    log.info(
+        {
+            workspaceId: existing.workspaceId,
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            subscriptionStatus: "canceled",
+        },
+        "Workspace updated from Shopify subscription cancelled"
+    );
+}
+
+export async function processShopifySubscriptionWebhook(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    input: {
+        lifecycle: ShopifySubscriptionLifecycle;
+        shopDomain: string | null;
+        payload: Record<string, unknown>;
+    }
+): Promise<void> {
+    const subscription = parseShopifySubscriptionWebhook({
+        topic: input.lifecycle,
+        payload: input.payload,
+    });
+
+    if (input.lifecycle === "created") {
+        if (!input.shopDomain) {
+            throw new Error("Missing X-Shopify-Shop-Domain header for Shopify subscription webhook");
+        }
+
+        const shop = await upsertShopifyShop(db, input.shopDomain);
+        await handleShopifySubscriptionCreated(db, log, { shopId: shop.id, subscription });
+        return;
+    }
+
+    if (input.lifecycle === "updated") {
+        await handleShopifySubscriptionUpdated(db, log, { subscription });
+        return;
+    }
+
+    await handleShopifySubscriptionCancelled(db, log, { subscription });
+}
+
 export async function recordShopifyWebhookEvent(
     app: FastifyInstance,
     input: {
@@ -654,7 +1237,19 @@ export async function recordShopifyWebhookEvent(
             return true;
         }
 
-        if (isShopifyOrderWebhookTopic(input.topic)) {
+        const subscriptionLifecycle = resolveShopifySubscriptionLifecycle(input.topic);
+
+        if (input.topic === SHOPIFY_ORDER_CANCELLED_TOPIC) {
+            await handleShopifyOrderCancelled(tx, input.log, input.payloadJson);
+        } else if (isShopifyRefundWebhookTopic(input.topic)) {
+            await handleShopifyRefundCreated(tx, input.log, input.payloadJson);
+        } else if (subscriptionLifecycle) {
+            await processShopifySubscriptionWebhook(tx, input.log, {
+                lifecycle: subscriptionLifecycle,
+                shopDomain: input.shopDomain,
+                payload: input.payloadJson,
+            });
+        } else if (isShopifyOrderWebhookTopic(input.topic)) {
             if (!input.shopDomain) {
                 throw new Error("Missing X-Shopify-Shop-Domain header for Shopify order webhook");
             }
