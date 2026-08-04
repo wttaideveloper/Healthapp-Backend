@@ -9,6 +9,7 @@ import { BadRequestError, ConflictError, UnauthorizedError } from "@core/errors/
 import { hashPassword, verifyPassword } from "@core/security/password";
 import { env } from "@config/env";
 import { getEntitlementState, linkWorkspaceMembershipsForUser } from "@modules/entitlement/entitlement.service";
+import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
 
 const registerBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -284,6 +285,12 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
                     .where(eq(passwordResets.id, activeReset.id));
             });
 
+            await recordAuditEvent(app.db, app.log, {
+                action: AUDIT_ACTIONS.PASSWORD_RESET,
+                actor: { id: foundUser.id, email: foundUser.email, role: foundUser.role },
+                target: { type: AUDIT_TARGETS.USER, id: foundUser.id, label: foundUser.email },
+            });
+
             return {
                 ok: true as const,
                 message: "Password updated successfully.",
@@ -317,6 +324,21 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
             }
 
             const isPasswordValid = await verifyPassword(req.body.password, foundUser.passwordHash);
+
+            // Only platform-admin sessions are audited. Logging every end-user app
+            // login would bury administrative actions under app traffic, and the
+            // spec scopes this to "Admin Login". Failures are recorded too — a
+            // rejected admin credential is exactly what a reviewer looks for.
+            if (foundUser.role === "admin") {
+                await recordAuditEvent(app.db, app.log, {
+                    action: AUDIT_ACTIONS.ADMIN_LOGIN,
+                    actor: { id: foundUser.id, email: foundUser.email, role: foundUser.role },
+                    target: { type: AUDIT_TARGETS.SESSION, id: foundUser.id, label: foundUser.email },
+                    result: isPasswordValid ? "success" : "failure",
+                    metadata: isPasswordValid ? null : { reason: "invalid_password" },
+                });
+            }
+
             if (!isPasswordValid) {
                 throw new UnauthorizedError("Invalid email or password");
             }

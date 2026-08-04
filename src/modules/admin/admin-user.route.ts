@@ -7,6 +7,7 @@ import { users } from "@db/schema";
 import { ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
 import { hashPassword } from "@core/security/password";
 import { getEntitlementState } from "@modules/entitlement/entitlement.service";
+import { AUDIT_ACTIONS, AUDIT_TARGETS, auditActorFromRequest, recordAuditEvent } from "@modules/audit/audit.service";
 
 const createAdminBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -92,6 +93,15 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
             if (!promotedUser) {
                 throw new NotFoundError("User not found for this email");
             }
+
+            await recordAuditEvent(app.db, app.log, {
+                action: AUDIT_ACTIONS.ADMIN_PROMOTED,
+                // Recovery via bootstrap token has no signed-in user; the row then
+                // records a system actor rather than pretending someone was present.
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.USER, id: promotedUser.id, label: promotedUser.email },
+                metadata: { via: isAuthorizedByAdminJwt ? "admin_jwt" : "bootstrap_token" },
+            });
 
             return {
                 id: promotedUser.id,
@@ -225,6 +235,13 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                     isEmailVerified: true,
                 })
                 .returning();
+
+            await recordAuditEvent(app.db, app.log, {
+                action: AUDIT_ACTIONS.ADMIN_CREATED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.USER, id: createdAdmin.id, label: createdAdmin.email },
+                metadata: { via: isAuthorizedByAdminJwt ? "admin_jwt" : "bootstrap_token" },
+            });
 
             return reply.status(201).send({
                 id: createdAdmin.id,

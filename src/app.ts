@@ -18,6 +18,7 @@ import { entitlementRoutes } from "./modules/entitlement/entitlement.route";
 import { stripeRoutes } from "./modules/stripe/stripe.route";
 import { adminUserRoutes } from "./modules/admin/admin-user.route";
 import { adminWorkspaceRoutes } from "./modules/admin/admin-workspace.route";
+import { auditRoutes } from "./modules/audit/audit.route";
 import { workspaceRoutes } from "./modules/workspace/workspace.route";
 import { legalRoutes } from "./modules/legal/legal.route";
 import { shopifyRoutes } from "./modules/shopify/shopify.route";
@@ -148,6 +149,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     typedApp.register(shopifyRoutes, { prefix: "/api/v1/shopify" });
     typedApp.register(adminUserRoutes, { prefix: "/api/v1/admin" });
     typedApp.register(adminWorkspaceRoutes, { prefix: "/api/v1/admin" });
+    typedApp.register(auditRoutes, { prefix: "/api/v1/admin" });
 
     return app;
 }

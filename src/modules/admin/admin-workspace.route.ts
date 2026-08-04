@@ -13,6 +13,13 @@ import {
     workspaceStatuses,
     workspaceSubscriptionStatuses,
 } from "@modules/workspace/workspace.util";
+import {
+    AUDIT_ACTIONS,
+    AUDIT_TARGETS,
+    auditActorFromRequest,
+    buildAuditChangeSet,
+    recordAuditEvent,
+} from "@modules/audit/audit.service";
 
 const idParamSchema = z.object({
     id: z.string().uuid(),
@@ -179,6 +186,44 @@ async function getActiveSeatCount(app: Parameters<FastifyPluginAsyncZod>[0], wor
     return Number(countRow?.count ?? 0);
 }
 
+/**
+ * Workspace name for an audit row's `workspaceName` column.
+ *
+ * One indexed primary-key lookup. Member mutations are human-driven and
+ * low-frequency, and denormalising the name is what keeps the audit row readable
+ * after the workspace is renamed or deleted.
+ */
+async function getWorkspaceLabel(
+    app: Parameters<FastifyPluginAsyncZod>[0],
+    workspaceId: string
+): Promise<string | null> {
+    const [row] = await app.db
+        .select({ name: workspaces.name })
+        .from(workspaces)
+        .where(eq(workspaces.id, workspaceId))
+        .limit(1);
+
+    return row?.name ?? null;
+}
+
+/** Maps a member transition onto the most specific audit action it represents. */
+function resolveMemberAuditAction(
+    before: { role: string; status: string },
+    after: { role: string; status: string }
+) {
+    if (before.status !== "revoked" && after.status === "revoked") {
+        // An invite that never became active was withdrawn, not a member removed.
+        return before.status === "invited" ? AUDIT_ACTIONS.INVITATION_REVOKED : AUDIT_ACTIONS.MEMBER_REMOVED;
+    }
+    if (before.status === "revoked" && after.status !== "revoked") {
+        return AUDIT_ACTIONS.MEMBER_RESTORED;
+    }
+    if (before.role !== after.role) {
+        return AUDIT_ACTIONS.MEMBER_ROLE_CHANGED;
+    }
+    return null;
+}
+
 async function findUserByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email: string) {
     return app.db
         .select({ id: users.id, name: users.name })
@@ -255,6 +300,19 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 });
 
                 return workspace;
+            });
+
+            await recordAuditEvent(app.db, req.log, {
+                action: AUDIT_ACTIONS.WORKSPACE_CREATED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.WORKSPACE, id: createdWorkspace.id, label: createdWorkspace.name },
+                workspace: { id: createdWorkspace.id, name: createdWorkspace.name },
+                metadata: {
+                    ownerEmail,
+                    seatLimit: createdWorkspace.seatLimit,
+                    plan: createdWorkspace.plan,
+                    subscriptionStatus: createdWorkspace.subscriptionStatus,
+                },
             });
 
             const ownerMail = getWorkspaceInviteEmailContent({
@@ -407,6 +465,43 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 .where(eq(workspaces.id, req.params.id))
                 .returning();
 
+            // One row per request, using the most specific action the change
+            // represents. The full field diff always rides along in metadata, so
+            // narrowing the action name never loses information.
+            const changes = buildAuditChangeSet(existingWorkspace, updatedWorkspace, [
+                "name",
+                "ownerEmail",
+                "seatLimit",
+                "plan",
+                "expiresAt",
+                "subscriptionStatus",
+                "status",
+                "notes",
+            ]);
+
+            if (changes) {
+                const becameRevoked =
+                    existingWorkspace.status !== "revoked" && updatedWorkspace.status === "revoked";
+                const subscriptionChanged =
+                    existingWorkspace.subscriptionStatus !== updatedWorkspace.subscriptionStatus;
+
+                await recordAuditEvent(app.db, req.log, {
+                    action: becameRevoked
+                        ? AUDIT_ACTIONS.WORKSPACE_REVOKED
+                        : subscriptionChanged
+                          ? AUDIT_ACTIONS.WORKSPACE_SUBSCRIPTION_CHANGED
+                          : AUDIT_ACTIONS.WORKSPACE_UPDATED,
+                    actor: auditActorFromRequest(req),
+                    target: {
+                        type: AUDIT_TARGETS.WORKSPACE,
+                        id: updatedWorkspace.id,
+                        label: updatedWorkspace.name,
+                    },
+                    workspace: { id: updatedWorkspace.id, name: updatedWorkspace.name },
+                    metadata: { changes },
+                });
+            }
+
             return serializeWorkspace(updatedWorkspace, await getActiveSeatCount(app, updatedWorkspace.id));
         }
     );
@@ -459,6 +554,14 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                     .where(eq(workspaceMembers.id, existingMember.id))
                     .returning();
 
+                await recordAuditEvent(app.db, req.log, {
+                    action: AUDIT_ACTIONS.MEMBER_INVITED,
+                    actor: auditActorFromRequest(req),
+                    target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                    workspace: { id: workspace.id, name: workspace.name },
+                    metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                });
+
                 const reactivatedMail = getWorkspaceInviteEmailContent({
                     organizationName: workspace.name,
                     userName: inferDisplayName(email, existingUser?.name),
@@ -494,6 +597,14 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             if (!createdMember) {
                 throw new ConflictError("This email is already a member of the workspace");
             }
+
+            await recordAuditEvent(app.db, req.log, {
+                action: AUDIT_ACTIONS.MEMBER_INVITED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
+                workspace: { id: workspace.id, name: workspace.name },
+                metadata: { role: req.body.role, status: createdMember.status },
+            });
 
             const memberMail = getWorkspaceInviteEmailContent({
                 organizationName: workspace.name,
@@ -557,6 +668,17 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 .where(eq(workspaceMembers.id, member.id))
                 .returning();
 
+            const memberAction = resolveMemberAuditAction(member, updatedMember);
+            if (memberAction) {
+                await recordAuditEvent(app.db, req.log, {
+                    action: memberAction,
+                    actor: auditActorFromRequest(req),
+                    target: { type: AUDIT_TARGETS.MEMBER, id: updatedMember.id, label: updatedMember.email },
+                    workspace: { id: req.params.id, name: await getWorkspaceLabel(app, req.params.id) },
+                    metadata: buildAuditChangeSet(member, updatedMember, ["role", "status"]),
+                });
+            }
+
             return serializeMember(updatedMember);
         }
     );
@@ -597,6 +719,17 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 })
                 .where(eq(workspaceMembers.id, member.id))
                 .returning();
+
+            await recordAuditEvent(app.db, req.log, {
+                action:
+                    member.status === "invited"
+                        ? AUDIT_ACTIONS.INVITATION_REVOKED
+                        : AUDIT_ACTIONS.MEMBER_REMOVED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.MEMBER, id: updatedMember.id, label: updatedMember.email },
+                workspace: { id: req.params.id, name: await getWorkspaceLabel(app, req.params.id) },
+                metadata: { role: updatedMember.role, previousStatus: member.status },
+            });
 
             return serializeMember(updatedMember);
         }

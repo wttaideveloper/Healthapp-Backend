@@ -3,6 +3,7 @@ import { FastifyInstance } from "fastify";
 
 import { revenuecatSubscriptions, storeEntitlements, stripeSubscriptions, workspaceMembers, workspaces } from "@db/schema";
 import { isWorkspaceAccessActive } from "@modules/workspace/workspace.util";
+import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
 
 export type EntitlementSource = "workspace" | "individual_iap" | "individual_stripe" | null;
 
@@ -48,7 +49,10 @@ export async function linkWorkspaceMembershipsForUser(
     const now = new Date();
 
     // Workspace invites are email-first, so account creation/login claims pending seats.
-    await app.db
+    // `.returning()` captures exactly which seats were claimed by THIS call, which
+    // is the real "member joined" moment — a no-op run returns nothing and audits
+    // nothing. Runs on every login, so it must stay a single statement.
+    const claimedSeats = await app.db
         .update(workspaceMembers)
         .set({
             userId: user.id,
@@ -56,7 +60,24 @@ export async function linkWorkspaceMembershipsForUser(
             joinedAt: now,
             updatedAt: now,
         })
-        .where(and(eq(workspaceMembers.email, user.email), isNull(workspaceMembers.userId), eq(workspaceMembers.status, "invited")));
+        .where(and(eq(workspaceMembers.email, user.email), isNull(workspaceMembers.userId), eq(workspaceMembers.status, "invited")))
+        .returning({
+            id: workspaceMembers.id,
+            workspaceId: workspaceMembers.workspaceId,
+            role: workspaceMembers.role,
+        });
+
+    for (const seat of claimedSeats) {
+        // The member is their own actor here: accepting an invitation is an action
+        // they took, not something an administrator did to them.
+        await recordAuditEvent(app.db, app.log, {
+            action: AUDIT_ACTIONS.MEMBER_JOINED,
+            actor: { id: user.id, email: user.email },
+            target: { type: AUDIT_TARGETS.MEMBER, id: seat.id, label: user.email },
+            workspace: { id: seat.workspaceId },
+            metadata: { role: seat.role },
+        });
+    }
 
     await app.db
         .update(workspaces)

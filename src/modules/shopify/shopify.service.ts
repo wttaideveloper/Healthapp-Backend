@@ -10,6 +10,7 @@ import {
     inferWorkspaceDisplayName,
 } from "@modules/workspace/workspace.email";
 import { normalizeEmail } from "@modules/workspace/workspace.util";
+import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
 import type { ShopifyOrderStatus } from "./shopify.constants";
 
 export type ShopifyWorkspaceOwnerEmail = {
@@ -522,6 +523,17 @@ async function revokeWorkspaceAccessFromShopifyOrder(
         })
         .where(eq(workspaces.id, input.workspaceId));
 
+    await recordAuditEvent(db, log, {
+        action: AUDIT_ACTIONS.WORKSPACE_CANCELLED_SHOPIFY,
+        target: { type: AUDIT_TARGETS.WORKSPACE, id: input.workspaceId },
+        workspace: { id: input.workspaceId },
+        metadata: {
+            shopifyOrderId: input.shopifyOrderId,
+            reason: input.reason,
+            subscriptionStatus: "canceled",
+        },
+    });
+
     log.info(
         {
             workspaceId: input.workspaceId,
@@ -741,6 +753,21 @@ export async function provisionWorkspaceFromShopifyPaidOrder(
         .where(eq(shopifyOrders.id, savedOrder.id));
 
     const ownerMembershipStatus = existingUser ? ("active" as const) : ("invited" as const);
+
+    // No actor: this is a provider webhook, not a person. Recording a null actor
+    // is honest; attributing it to an admin would not be.
+    await recordAuditEvent(db, log, {
+        action: AUDIT_ACTIONS.WORKSPACE_PROVISIONED_SHOPIFY,
+        target: { type: AUDIT_TARGETS.WORKSPACE, id: workspace.id, label: workspaceName },
+        workspace: { id: workspace.id, name: workspaceName },
+        metadata: {
+            shopifyOrderId: savedOrder.shopifyOrderId,
+            orderNumber: savedOrder.orderNumber,
+            ownerEmail,
+            seatLimit: savedOrder.seatQuantity,
+            ownerMembershipStatus,
+        },
+    });
 
     log.info(
         {
@@ -1166,6 +1193,17 @@ export async function handleShopifySubscriptionCancelled(
             updatedAt: now,
         })
         .where(eq(workspaces.id, existing.workspaceId));
+
+    await recordAuditEvent(db, log, {
+        action: AUDIT_ACTIONS.WORKSPACE_CANCELLED_SHOPIFY,
+        target: { type: AUDIT_TARGETS.WORKSPACE, id: existing.workspaceId },
+        workspace: { id: existing.workspaceId },
+        metadata: {
+            shopifySubscriptionId: subscription.shopifySubscriptionId,
+            reason: "subscription_cancelled",
+            subscriptionStatus: "canceled",
+        },
+    });
 
     log.info(
         {

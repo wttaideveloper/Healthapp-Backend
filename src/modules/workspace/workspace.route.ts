@@ -7,6 +7,30 @@ import { env } from "@config/env";
 import { users, workspaceMembers, workspaces } from "@db/schema";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
 import { normalizeEmail } from "./workspace.util";
+import {
+    AUDIT_ACTIONS,
+    AUDIT_TARGETS,
+    auditActorFromRequest,
+    buildAuditChangeSet,
+    recordAuditEvent,
+} from "@modules/audit/audit.service";
+
+/** Maps a member transition onto the most specific audit action it represents. */
+function resolveMemberAuditAction(
+    before: { role: string; status: string },
+    after: { role: string; status: string }
+) {
+    if (before.status !== "revoked" && after.status === "revoked") {
+        return before.status === "invited" ? AUDIT_ACTIONS.INVITATION_REVOKED : AUDIT_ACTIONS.MEMBER_REMOVED;
+    }
+    if (before.status === "revoked" && after.status !== "revoked") {
+        return AUDIT_ACTIONS.MEMBER_RESTORED;
+    }
+    if (before.role !== after.role) {
+        return AUDIT_ACTIONS.MEMBER_ROLE_CHANGED;
+    }
+    return null;
+}
 
 const idParamSchema = z.object({
     id: z.string().uuid(),
@@ -294,6 +318,14 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                     .where(eq(workspaceMembers.id, existingMember.id))
                     .returning();
 
+                await recordAuditEvent(app.db, req.log, {
+                    action: AUDIT_ACTIONS.MEMBER_INVITED,
+                    actor: auditActorFromRequest(req),
+                    target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                    workspace: { id: workspace.id, name: workspace.name },
+                    metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                });
+
                 const reactivatedMail = getWorkspaceInviteEmailContent({
                     organizationName: workspace.name,
                     userName: inferDisplayName(email, existingUser?.name),
@@ -329,6 +361,14 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 throw new ConflictError("This email is already a member of the workspace");
             }
 
+            await recordAuditEvent(app.db, req.log, {
+                action: AUDIT_ACTIONS.MEMBER_INVITED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
+                workspace: { id: workspace.id, name: workspace.name },
+                metadata: { role: req.body.role, status: createdMember.status },
+            });
+
             const inviteMail = getWorkspaceInviteEmailContent({
                 organizationName: workspace.name,
                 userName: inferDisplayName(email, existingUser?.name),
@@ -361,7 +401,7 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             },
         },
         async (req) => {
-            await requireWorkspaceManager(app, req.authUser!.sub, req.params.id);
+            const { workspace } = await requireWorkspaceManager(app, req.authUser!.sub, req.params.id);
 
             const [member] = await app.db
                 .select()
@@ -392,6 +432,17 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 .where(eq(workspaceMembers.id, member.id))
                 .returning();
 
+            const memberAction = resolveMemberAuditAction(member, updatedMember);
+            if (memberAction) {
+                await recordAuditEvent(app.db, req.log, {
+                    action: memberAction,
+                    actor: auditActorFromRequest(req),
+                    target: { type: AUDIT_TARGETS.MEMBER, id: updatedMember.id, label: updatedMember.email },
+                    workspace: { id: workspace.id, name: workspace.name },
+                    metadata: buildAuditChangeSet(member, updatedMember, ["role", "status"]),
+                });
+            }
+
             return serializeMember(updatedMember);
         }
     );
@@ -409,7 +460,7 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             },
         },
         async (req) => {
-            await requireWorkspaceManager(app, req.authUser!.sub, req.params.id);
+            const { workspace } = await requireWorkspaceManager(app, req.authUser!.sub, req.params.id);
 
             const [member] = await app.db
                 .select()
@@ -434,6 +485,17 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 })
                 .where(eq(workspaceMembers.id, member.id))
                 .returning();
+
+            await recordAuditEvent(app.db, req.log, {
+                action:
+                    member.status === "invited"
+                        ? AUDIT_ACTIONS.INVITATION_REVOKED
+                        : AUDIT_ACTIONS.MEMBER_REMOVED,
+                actor: auditActorFromRequest(req),
+                target: { type: AUDIT_TARGETS.MEMBER, id: updatedMember.id, label: updatedMember.email },
+                workspace: { id: workspace.id, name: workspace.name },
+                metadata: { role: updatedMember.role, previousStatus: member.status },
+            });
 
             return serializeMember(updatedMember);
         }

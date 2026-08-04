@@ -50,6 +50,13 @@
       "when": 1784131200000,
       "tag": "0007_shopify_licensing",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786060800000,
+      "tag": "0008_audit_logs",
+      "breakpoints": true
     }
   ]
 }
