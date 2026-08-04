@@ -30,6 +30,12 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/users/promote-admin",
         {
+            config: {
+                rateLimit: {
+                    max: env.RATE_LIMIT_ADMIN_BOOTSTRAP_MAX,
+                    timeWindow: "1 minute",
+                },
+            },
             schema: {
                 summary: "Promote existing user to admin",
                 headers: createAdminHeadersSchema,
@@ -141,6 +147,12 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/users/admin",
         {
+            config: {
+                rateLimit: {
+                    max: env.RATE_LIMIT_ADMIN_BOOTSTRAP_MAX,
+                    timeWindow: "1 minute",
+                },
+            },
             schema: {
                 summary: "Create admin user",
                 headers: createAdminHeadersSchema,
@@ -156,37 +168,37 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
             },
         },
         async (req, reply) => {
-            // let isAuthorizedByAdminJwt = false;
+            let isAuthorizedByAdminJwt = false;
 
-            // if (req.headers.authorization) {
-            //     try {
-            //         await app.authenticate(req);
-            //         isAuthorizedByAdminJwt = req.authUser?.role === "admin";
-            //     } catch {
-            //         isAuthorizedByAdminJwt = false;
-            //     }
-            // }
+            if (req.headers.authorization) {
+                try {
+                    await app.authenticate(req);
+                    isAuthorizedByAdminJwt = req.authUser?.role === "admin";
+                } catch {
+                    isAuthorizedByAdminJwt = false;
+                }
+            }
 
-            // let isAuthorizedByBootstrapToken = false;
-            // if (!isAuthorizedByAdminJwt && env.ADMIN_BOOTSTRAP_TOKEN) {
-            //     const [adminCountRow] = await app.db
-            //         .select({ count: sql<number>`count(*)` })
-            //         .from(users)
-            //         .where(eq(users.role, "admin"));
+            let isAuthorizedByBootstrapToken = false;
+            if (!isAuthorizedByAdminJwt && env.ADMIN_BOOTSTRAP_TOKEN) {
+                const [adminCountRow] = await app.db
+                    .select({ count: sql<number>`count(*)` })
+                    .from(users)
+                    .where(eq(users.role, "admin"));
 
-            //     const adminCount = Number(adminCountRow?.count ?? 0);
-            //     const providedToken = req.headers["x-bootstrap-token"];
+                const adminCount = Number(adminCountRow?.count ?? 0);
+                const providedToken = req.headers["x-bootstrap-token"];
 
-            //     if (adminCount === 0 && providedToken === env.ADMIN_BOOTSTRAP_TOKEN) {
-            //         isAuthorizedByBootstrapToken = true;
-            //     }
-            // }
+                if (adminCount === 0 && providedToken === env.ADMIN_BOOTSTRAP_TOKEN) {
+                    isAuthorizedByBootstrapToken = true;
+                }
+            }
 
-            // if (!isAuthorizedByAdminJwt && !isAuthorizedByBootstrapToken) {
-            //     throw new ForbiddenError(
-            //         "Only admins can create another admin. For first admin setup, provide valid x-bootstrap-token"
-            //     );
-            // }
+            if (!isAuthorizedByAdminJwt && !isAuthorizedByBootstrapToken) {
+                throw new ForbiddenError(
+                    "Only admins can create another admin. For first admin setup, provide valid x-bootstrap-token"
+                );
+            }
 
             const email = normalizeEmail(req.body.email);
 

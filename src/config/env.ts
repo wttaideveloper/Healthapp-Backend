@@ -6,6 +6,23 @@ const envSchema = z.object({
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
     DATABASE_URL: z.url(),
     JWT_SECRET: z.string().min(32),
+    /**
+     * Access token lifetime. Previously tokens were signed without an expiry and
+     * were therefore valid forever. Defaults to 30d so existing mobile/desktop
+     * clients (which have no refresh-token flow) are not logged out aggressively.
+     * Shorten once a refresh-token flow exists.
+     */
+    JWT_EXPIRES_IN: z.string().min(1).default('30d'),
+    /** Trust X-Forwarded-For. Required for per-IP rate limiting behind nginx. */
+    TRUST_PROXY: z.enum(['true', 'false']).default('true'),
+    /** Requests per minute per IP for general traffic. */
+    RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().positive().default(300),
+    /** Requests per minute per IP for login/register/password-reset. */
+    RATE_LIMIT_AUTH_MAX: z.coerce.number().int().positive().default(10),
+    /** Requests per minute per IP for admin bootstrap endpoints. */
+    RATE_LIMIT_ADMIN_BOOTSTRAP_MAX: z.coerce.number().int().positive().default(5),
+    /** Force Swagger UI on/off. Defaults to off in production. */
+    ENABLE_SWAGGER: z.enum(['true', 'false']).optional(),
     SMTP_HOST: z.string().min(1),
     SMTP_PORT: z.coerce.number().min(1),
     SMTP_USER: z.string().min(1),

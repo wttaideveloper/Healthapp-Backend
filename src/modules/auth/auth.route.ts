@@ -93,6 +93,17 @@ function isBootstrapAdminEmail(email: string): boolean {
     return admins.includes(email);
 }
 
+/**
+ * Tight per-IP throttle for credential and OTP endpoints.
+ * Mitigates credential stuffing, OTP brute force, and reset-email bombing.
+ */
+const authRateLimit = {
+    rateLimit: {
+        max: env.RATE_LIMIT_AUTH_MAX,
+        timeWindow: "1 minute",
+    },
+};
+
 export const authRoutes: FastifyPluginAsyncZod = async (app) => {
     const smtpTransport = nodemailer.createTransport({
         host: env.SMTP_HOST,
@@ -107,6 +118,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/register",
         {
+            config: authRateLimit,
             schema: {
                 summary: "Register a user",
                 body: registerBodySchema,
@@ -163,6 +175,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/forgot-password",
         {
+            config: authRateLimit,
             schema: {
                 summary: "Request password reset email",
                 body: forgotPasswordBodySchema,
@@ -210,6 +223,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/reset-password",
         {
+            config: authRateLimit,
             schema: {
                 summary: "Reset password with reset token",
                 body: resetPasswordBodySchema,
@@ -280,6 +294,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
         "/login",
         {
+            config: authRateLimit,
             schema: {
                 summary: "Log in user",
                 body: loginBodySchema,
