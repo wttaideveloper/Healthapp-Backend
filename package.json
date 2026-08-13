@@ -15,6 +15,8 @@
     "db:push": "drizzle-kit push",
     "db:studio": "dotenv -e .env -- drizzle-kit studio",
     "entitlements:cleanup": "tsx scripts/reconcile-store-entitlements.ts",
+    "migrate:legacy-shopify:dry-run": "tsx --env-file=.env scripts/migrations/legacy-shopify-customers/dry-run.ts",
+    "migrate:legacy-shopify:dry-run:csv-only": "tsx scripts/migrations/legacy-shopify-customers/dry-run.ts --skip-db",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
     "docker:restart": "docker compose down && docker compose up -d --build",

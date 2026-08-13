@@ -10,3 +10,6 @@ request/
 
 docs/
 frontend/
+
+# Migration dry-run output contains customer names and email addresses.
+migration-reports/
