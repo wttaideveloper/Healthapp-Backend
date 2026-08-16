@@ -1,0 +1,9 @@
+process.env.NODE_ENV = process.env.NODE_ENV ?? "test";
+process.env.DATABASE_URL = process.env.DATABASE_URL ?? "postgres://healthage:healthage@localhost:5432/healthage";
+process.env.JWT_SECRET = process.env.JWT_SECRET ?? "test-jwt-secret-that-is-at-least-32-chars";
+process.env.SMTP_HOST = process.env.SMTP_HOST ?? "localhost";
+process.env.SMTP_PORT = process.env.SMTP_PORT ?? "587";
+process.env.SMTP_USER = process.env.SMTP_USER ?? "user";
+process.env.SMTP_PASS = process.env.SMTP_PASS ?? "pass";
+process.env.SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET ?? "shopify-webhook-secret";
+process.env.SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN ?? "qfiprz-kw.myshopify.com";

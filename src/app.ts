@@ -21,7 +21,7 @@ import { adminWorkspaceRoutes } from "./modules/admin/admin-workspace.route";
 import { auditRoutes } from "./modules/audit/audit.route";
 import { workspaceRoutes } from "./modules/workspace/workspace.route";
 import { legalRoutes } from "./modules/legal/legal.route";
-import { shopifyRoutes } from "./modules/shopify/shopify.route";
+import { shopifyOrderPaidWebhookRoutes, shopifyRoutes } from "./modules/shopify/shopify.route";
 
 /** Swagger UI is developer tooling: off in production unless explicitly forced on. */
 const isSwaggerEnabled =
@@ -108,6 +108,7 @@ export async function buildApp(): Promise<FastifyInstance> {
             return (
                 path === "/api/v1/stripe/webhook" ||
                 path === "/api/v1/shopify/webhook" ||
+                path === "/shopify/webhooks/order-paid" ||
                 path.startsWith("/api/v1/health")
             );
         },
@@ -147,6 +148,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     typedApp.register(workspaceRoutes, { prefix: "/api/v1/workspaces" });
     typedApp.register(stripeRoutes, { prefix: "/api/v1/stripe" });
     typedApp.register(shopifyRoutes, { prefix: "/api/v1/shopify" });
+    typedApp.register(shopifyOrderPaidWebhookRoutes, { prefix: "/shopify/webhooks" });
     typedApp.register(adminUserRoutes, { prefix: "/api/v1/admin" });
     typedApp.register(adminWorkspaceRoutes, { prefix: "/api/v1/admin" });
     typedApp.register(auditRoutes, { prefix: "/api/v1/admin" });

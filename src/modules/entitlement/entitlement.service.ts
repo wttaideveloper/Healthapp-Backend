@@ -88,11 +88,51 @@ export async function linkWorkspaceMembershipsForUser(
         .where(and(eq(workspaces.ownerEmail, user.email), isNull(workspaces.ownerUserId)));
 }
 
+export type WorkspaceAccessCandidate = {
+    workspaceId: string;
+    workspaceName: string;
+    role: string;
+    memberStatus: string;
+    plan: string;
+    seatLimit: number;
+    workspaceStatus: string;
+    subscriptionStatus: string;
+    expiresAt: Date | null;
+    updatedAt: Date;
+};
+
+export function selectPreferredWorkspaceAccess(
+    candidates: WorkspaceAccessCandidate[]
+): WorkspaceAccessCandidate | null {
+    const active = candidates.filter((candidate) =>
+        isWorkspaceAccessActive({
+            workspaceStatus: candidate.workspaceStatus,
+            subscriptionStatus: candidate.subscriptionStatus,
+            expiresAt: candidate.expiresAt,
+        })
+    );
+
+    if (active.length === 0) {
+        return null;
+    }
+
+    active.sort((left, right) => {
+        const updatedDiff = right.updatedAt.getTime() - left.updatedAt.getTime();
+        if (updatedDiff !== 0) {
+            return updatedDiff;
+        }
+        return left.workspaceId.localeCompare(right.workspaceId);
+    });
+
+    return active[0] ?? null;
+}
+
 export async function getEntitlementState(app: FastifyInstance, userId: string): Promise<EntitlementState> {
     const now = new Date();
 
     // Workspace access wins over individual purchases so organization users never see paywalls.
-    const [workspaceAccess] = await app.db
+    // Prefer an active workspace; a cancelled/expired row must not shadow a valid one.
+    const memberships = await app.db
         .select({
             workspaceId: workspaces.id,
             workspaceName: workspaces.name,
@@ -107,18 +147,11 @@ export async function getEntitlementState(app: FastifyInstance, userId: string):
         })
         .from(workspaceMembers)
         .innerJoin(workspaces, eq(workspaces.id, workspaceMembers.workspaceId))
-        .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.status, "active")))
-        .orderBy(desc(workspaces.updatedAt))
-        .limit(1);
+        .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.status, "active")));
 
-    if (
-        workspaceAccess &&
-        isWorkspaceAccessActive({
-            workspaceStatus: workspaceAccess.workspaceStatus,
-            subscriptionStatus: workspaceAccess.subscriptionStatus,
-            expiresAt: workspaceAccess.expiresAt,
-        })
-    ) {
+    const workspaceAccess = selectPreferredWorkspaceAccess(memberships);
+
+    if (workspaceAccess) {
         return {
             hasAccess: true,
             source: "workspace",

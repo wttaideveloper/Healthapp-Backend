@@ -40,6 +40,7 @@ const envSchema = z.object({
     SHOPIFY_API_SECRET: z.string().min(1).optional(),
     SHOPIFY_WEBHOOK_SECRET: z.string().min(1).optional(),
     SHOPIFY_ACCESS_TOKEN: z.string().min(1).optional(),
+    /** Store hostname, e.g. example.myshopify.com. Used to validate incoming webhooks. */
     SHOPIFY_SHOP_DOMAIN: z.string().min(1).optional(),
 
 });

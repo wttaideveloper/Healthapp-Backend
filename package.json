@@ -9,6 +9,7 @@
     "nuke": "kill -9 $(lsof -t -i:8081) || true",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/modules/shopify/shopify.license.test.ts src/modules/shopify/shopify.webhook-route.test.ts src/modules/shopify/shopify.subscription-isolation.test.ts src/modules/shopify/shopify.phase3.test.ts src/modules/entitlement/entitlement.service.test.ts src/modules/workspace/workspace.seats.test.ts",
     "lint": "eslint .",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

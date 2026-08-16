@@ -42,6 +42,7 @@ export const AUDIT_ACTIONS = {
     WORKSPACE_REVOKED: "workspace.revoked",
     WORKSPACE_SUBSCRIPTION_CHANGED: "workspace.subscription_changed",
     WORKSPACE_PROVISIONED_SHOPIFY: "workspace.provisioned_shopify",
+    WORKSPACE_LICENSES_UPDATED_SHOPIFY: "workspace.licenses_updated_shopify",
     WORKSPACE_CANCELLED_SHOPIFY: "workspace.cancelled_shopify",
 
     MEMBER_INVITED: "member.invited",

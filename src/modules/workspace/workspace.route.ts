@@ -1,4 +1,4 @@
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import nodemailer from "nodemailer";
 import z from "zod";
@@ -7,6 +7,7 @@ import { env } from "@config/env";
 import { users, workspaceMembers, workspaces } from "@db/schema";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
 import { normalizeEmail } from "./workspace.util";
+import { assertWorkspaceHasAvailableSeat, countNonRevokedWorkspaceSeats } from "./workspace.seats";
 import {
     AUDIT_ACTIONS,
     AUDIT_TARGETS,
@@ -131,12 +132,7 @@ function serializeMember(row: typeof workspaceMembers.$inferSelect) {
 }
 
 async function getActiveSeatCount(app: Parameters<FastifyPluginAsyncZod>[0], workspaceId: string): Promise<number> {
-    const [countRow] = await app.db
-        .select({ count: sql<number>`count(*)` })
-        .from(workspaceMembers)
-        .where(and(eq(workspaceMembers.workspaceId, workspaceId), ne(workspaceMembers.status, "revoked")));
-
-    return Number(countRow?.count ?? 0);
+    return countNonRevokedWorkspaceSeats(app.db, workspaceId);
 }
 
 async function findUserIdByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email: string): Promise<string | null> {
@@ -284,89 +280,77 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 throw new ForbiddenError("Workspace is not active");
             }
 
-            const activeSeatCount = await getActiveSeatCount(app, workspace.id);
-            if (activeSeatCount >= workspace.seatLimit) {
-                throw new ForbiddenError("Workspace seat limit reached");
-            }
-
             const email = normalizeEmail(req.body.email);
             const existingUser = await findUserByEmail(app, email);
             const userId = existingUser?.id ?? null;
             const now = new Date();
-            const [existingMember] = await app.db
-                .select()
-                .from(workspaceMembers)
-                .where(and(eq(workspaceMembers.workspaceId, workspace.id), eq(workspaceMembers.email, email)))
-                .limit(1);
 
-            if (existingMember && existingMember.status !== "revoked") {
-                throw new ConflictError("This email is already a member of the workspace");
-            }
+            const savedMember = await app.db.transaction(async (tx) => {
+                await assertWorkspaceHasAvailableSeat(tx, workspace.id);
 
-            if (existingMember) {
-                const [reactivatedMember] = await app.db
-                    .update(workspaceMembers)
-                    .set({
-                        userId: userId ?? existingMember.userId,
+                const [existingMember] = await tx
+                    .select()
+                    .from(workspaceMembers)
+                    .where(and(eq(workspaceMembers.workspaceId, workspace.id), eq(workspaceMembers.email, email)))
+                    .limit(1);
+
+                if (existingMember && existingMember.status !== "revoked") {
+                    throw new ConflictError("This email is already a member of the workspace");
+                }
+
+                if (existingMember) {
+                    const [reactivatedMember] = await tx
+                        .update(workspaceMembers)
+                        .set({
+                            userId: userId ?? existingMember.userId,
+                            role: req.body.role,
+                            status: userId ? "active" : "invited",
+                            revokedAt: null,
+                            invitedByUserId: req.authUser!.sub,
+                            joinedAt: userId ? now : null,
+                            updatedAt: now,
+                        })
+                        .where(eq(workspaceMembers.id, existingMember.id))
+                        .returning();
+
+                    await recordAuditEvent(tx, req.log, {
+                        action: AUDIT_ACTIONS.MEMBER_INVITED,
+                        actor: auditActorFromRequest(req),
+                        target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                        workspace: { id: workspace.id, name: workspace.name },
+                        metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                    });
+
+                    return reactivatedMember;
+                }
+
+                const [createdMember] = await tx
+                    .insert(workspaceMembers)
+                    .values({
+                        workspaceId: workspace.id,
+                        userId,
+                        email,
                         role: req.body.role,
                         status: userId ? "active" : "invited",
-                        revokedAt: null,
                         invitedByUserId: req.authUser!.sub,
                         joinedAt: userId ? now : null,
-                        updatedAt: now,
                     })
-                    .where(eq(workspaceMembers.id, existingMember.id))
+                    .onConflictDoNothing()
                     .returning();
 
-                await recordAuditEvent(app.db, req.log, {
+                if (!createdMember) {
+                    throw new ConflictError("This email is already a member of the workspace");
+                }
+
+                await recordAuditEvent(tx, req.log, {
                     action: AUDIT_ACTIONS.MEMBER_INVITED,
                     actor: auditActorFromRequest(req),
-                    target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                    target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
                     workspace: { id: workspace.id, name: workspace.name },
-                    metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                    metadata: { role: req.body.role, status: createdMember.status },
                 });
 
-                const reactivatedMail = getWorkspaceInviteEmailContent({
-                    organizationName: workspace.name,
-                    userName: inferDisplayName(email, existingUser?.name),
-                    userEmail: email,
-                });
-
-                await smtpTransport.sendMail({
-                    from: env.EMAIL_FROM ?? env.SMTP_USER,
-                    to: email,
-                    subject: reactivatedMail.subject,
-                    text: reactivatedMail.text,
-                    html: reactivatedMail.html,
-                });
-
-                return reply.status(201).send(serializeMember(reactivatedMember));
-            }
-
-            const [createdMember] = await app.db
-                .insert(workspaceMembers)
-                .values({
-                    workspaceId: workspace.id,
-                    userId,
-                    email,
-                    role: req.body.role,
-                    status: userId ? "active" : "invited",
-                    invitedByUserId: req.authUser!.sub,
-                    joinedAt: userId ? now : null,
-                })
-                .onConflictDoNothing()
-                .returning();
-
-            if (!createdMember) {
-                throw new ConflictError("This email is already a member of the workspace");
-            }
-
-            await recordAuditEvent(app.db, req.log, {
-                action: AUDIT_ACTIONS.MEMBER_INVITED,
-                actor: auditActorFromRequest(req),
-                target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
-                workspace: { id: workspace.id, name: workspace.name },
-                metadata: { role: req.body.role, status: createdMember.status },
+                return createdMember;
             });
 
             const inviteMail = getWorkspaceInviteEmailContent({
@@ -383,7 +367,7 @@ export const workspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 html: inviteMail.html,
             });
 
-            return reply.status(201).send(serializeMember(createdMember));
+            return reply.status(201).send(serializeMember(savedMember));
         }
     );
 

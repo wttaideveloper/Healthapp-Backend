@@ -1,4 +1,4 @@
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import nodemailer from "nodemailer";
 import z from "zod";
@@ -6,6 +6,8 @@ import z from "zod";
 import { env } from "@config/env";
 import { users, workspaceMembers, workspaces } from "@db/schema";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-errors";
+import { loadWorkspaceLicensingView, loadWorkspaceShopifyOrders, serializeWorkspaceShopifyOrders } from "@modules/shopify/shopify.admin";
+import { resolveShopifyManagedAdminWorkspaceUpdate } from "@modules/shopify/shopify.license";
 import {
     normalizeEmail,
     workspaceMemberStatuses,
@@ -13,6 +15,7 @@ import {
     workspaceStatuses,
     workspaceSubscriptionStatuses,
 } from "@modules/workspace/workspace.util";
+import { assertWorkspaceHasAvailableSeat, countNonRevokedWorkspaceSeats } from "@modules/workspace/workspace.seats";
 import {
     AUDIT_ACTIONS,
     AUDIT_TARGETS,
@@ -62,6 +65,45 @@ const updateMemberBodySchema = z.object({
     status: z.enum(workspaceMemberStatuses).optional(),
 });
 
+const shopifyAdminOrderProductSchema = z.object({
+    productId: z.string(),
+    productTitle: z.string(),
+    quantity: z.number().int(),
+    seatCount: z.number().int(),
+    licensed: z.boolean(),
+});
+
+const shopifyAdminOrderSchema = z.object({
+    shopifyOrderId: z.string(),
+    orderNumber: z.string().nullable(),
+    status: z.string(),
+    financialStatus: z.string().nullable(),
+    fulfillmentStatus: z.string().nullable(),
+    seatQuantity: z.number().int(),
+    createdAt: z.string().datetime(),
+    paidAt: z.string().datetime().nullable(),
+    cancelled: z.boolean(),
+    refunded: z.boolean(),
+    products: z.array(shopifyAdminOrderProductSchema),
+});
+
+const workspaceLicensingResponseSchema = z.object({
+    workspaceId: z.string().uuid(),
+    billingSource: z.string(),
+    shopifyShopId: z.string().nullable(),
+    shopDomain: z.string().nullable(),
+    shopifyCustomerId: z.string().nullable(),
+    totalLicenses: z.number().int(),
+    assignedLicenses: z.number().int(),
+    remainingLicenses: z.number().int(),
+    overAllocated: z.boolean(),
+    overAllocatedBy: z.number().int(),
+    expiresAt: z.string().datetime().nullable(),
+    subscriptionStatus: z.string(),
+    shopifyOrderCount: z.number().int(),
+    latestShopifyOrder: shopifyAdminOrderSchema.nullable(),
+});
+
 const workspaceResponseSchema = z.object({
     id: z.string().uuid(),
     name: z.string(),
@@ -69,6 +111,7 @@ const workspaceResponseSchema = z.object({
     ownerEmail: z.string().email(),
     status: z.string(),
     subscriptionStatus: z.string(),
+    billingSource: z.string(),
     plan: z.string(),
     seatLimit: z.number().int(),
     activeSeatCount: z.number().int(),
@@ -149,6 +192,7 @@ function serializeWorkspace(row: typeof workspaces.$inferSelect, activeSeatCount
         ownerEmail: row.ownerEmail,
         status: row.status,
         subscriptionStatus: row.subscriptionStatus,
+        billingSource: row.billingSource,
         plan: row.plan,
         seatLimit: row.seatLimit,
         activeSeatCount,
@@ -178,12 +222,7 @@ function serializeMember(row: typeof workspaceMembers.$inferSelect) {
 }
 
 async function getActiveSeatCount(app: Parameters<FastifyPluginAsyncZod>[0], workspaceId: string): Promise<number> {
-    const [countRow] = await app.db
-        .select({ count: sql<number>`count(*)` })
-        .from(workspaceMembers)
-        .where(and(eq(workspaceMembers.workspaceId, workspaceId), ne(workspaceMembers.status, "revoked")));
-
-    return Number(countRow?.count ?? 0);
+    return countNonRevokedWorkspaceSeats(app.db, workspaceId);
 }
 
 /**
@@ -231,17 +270,6 @@ async function findUserByEmail(app: Parameters<FastifyPluginAsyncZod>[0], email:
         .where(eq(users.email, email))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-}
-
-async function ensureWorkspaceCapacity(
-    app: Parameters<FastifyPluginAsyncZod>[0],
-    workspaceId: string,
-    seatLimit: number
-) {
-    const activeSeatCount = await getActiveSeatCount(app, workspaceId);
-    if (activeSeatCount >= seatLimit) {
-        throw new ForbiddenError("Workspace seat limit reached");
-    }
 }
 
 export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
@@ -390,6 +418,7 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 response: {
                     200: workspaceResponseSchema.extend({
                         members: z.array(memberResponseSchema),
+                        licensing: workspaceLicensingResponseSchema,
                     }),
                 },
             },
@@ -409,7 +438,53 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             return {
                 ...serializeWorkspace(workspace, await getActiveSeatCount(app, workspace.id)),
                 members: members.map(serializeMember),
+                licensing: await loadWorkspaceLicensingView(app.db, workspace),
             };
+        }
+    );
+
+    app.get(
+        "/workspaces/:id/licensing",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "Get workspace license totals, assignment, and Shopify billing summary",
+                params: idParamSchema,
+                response: {
+                    200: workspaceLicensingResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const [workspace] = await app.db.select().from(workspaces).where(eq(workspaces.id, req.params.id)).limit(1);
+            if (!workspace) {
+                throw new NotFoundError("Workspace not found");
+            }
+
+            return loadWorkspaceLicensingView(app.db, workspace);
+        }
+    );
+
+    app.get(
+        "/workspaces/:id/shopify-orders",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "List Shopify orders linked to a workspace",
+                params: idParamSchema,
+                response: {
+                    200: z.array(shopifyAdminOrderSchema),
+                },
+            },
+        },
+        async (req) => {
+            const [workspace] = await app.db.select().from(workspaces).where(eq(workspaces.id, req.params.id)).limit(1);
+            if (!workspace) {
+                throw new NotFoundError("Workspace not found");
+            }
+
+            const orders = await loadWorkspaceShopifyOrders(app.db, workspace.id);
+            return serializeWorkspaceShopifyOrders(orders);
         }
     );
 
@@ -430,6 +505,20 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             const [existingWorkspace] = await app.db.select().from(workspaces).where(eq(workspaces.id, req.params.id)).limit(1);
             if (!existingWorkspace) {
                 throw new NotFoundError("Workspace not found");
+            }
+
+            const shopifyLicensingUpdate = resolveShopifyManagedAdminWorkspaceUpdate({
+                billingSource: existingWorkspace.billingSource,
+                requested: {
+                    seatLimit: req.body.seatLimit,
+                    expiresAt: req.body.expiresAt,
+                    subscriptionStatus: req.body.subscriptionStatus,
+                },
+            });
+            if (!shopifyLicensingUpdate.allowed) {
+                throw new ForbiddenError(
+                    `Shopify-managed licensing fields cannot be changed via admin update: ${shopifyLicensingUpdate.protectedFields.join(", ")}`
+                );
             }
 
             if (req.body.seatLimit !== undefined) {
@@ -525,85 +614,76 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 throw new NotFoundError("Workspace not found");
             }
 
-            await ensureWorkspaceCapacity(app, workspace.id, workspace.seatLimit);
-
             const email = normalizeEmail(req.body.email);
             const existingUser = await findUserByEmail(app, email);
-            const [existingMember] = await app.db
-                .select()
-                .from(workspaceMembers)
-                .where(and(eq(workspaceMembers.workspaceId, workspace.id), eq(workspaceMembers.email, email)))
-                .limit(1);
+            const now = new Date();
 
-            if (existingMember && existingMember.status !== "revoked") {
-                throw new ConflictError("This email is already a member of the workspace");
-            }
+            const savedMember = await app.db.transaction(async (tx) => {
+                await assertWorkspaceHasAvailableSeat(tx, workspace.id);
 
-            if (existingMember) {
-                const [reactivatedMember] = await app.db
-                    .update(workspaceMembers)
-                    .set({
-                        userId: existingUser?.id ?? existingMember.userId,
+                const [existingMember] = await tx
+                    .select()
+                    .from(workspaceMembers)
+                    .where(and(eq(workspaceMembers.workspaceId, workspace.id), eq(workspaceMembers.email, email)))
+                    .limit(1);
+
+                if (existingMember && existingMember.status !== "revoked") {
+                    throw new ConflictError("This email is already a member of the workspace");
+                }
+
+                if (existingMember) {
+                    const [reactivatedMember] = await tx
+                        .update(workspaceMembers)
+                        .set({
+                            userId: existingUser?.id ?? existingMember.userId,
+                            role: req.body.role,
+                            status: existingUser ? "active" : "invited",
+                            revokedAt: null,
+                            invitedByUserId: req.authUser!.sub,
+                            joinedAt: existingUser ? now : null,
+                            updatedAt: now,
+                        })
+                        .where(eq(workspaceMembers.id, existingMember.id))
+                        .returning();
+
+                    await recordAuditEvent(tx, req.log, {
+                        action: AUDIT_ACTIONS.MEMBER_INVITED,
+                        actor: auditActorFromRequest(req),
+                        target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                        workspace: { id: workspace.id, name: workspace.name },
+                        metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                    });
+
+                    return reactivatedMember;
+                }
+
+                const [createdMember] = await tx
+                    .insert(workspaceMembers)
+                    .values({
+                        workspaceId: workspace.id,
+                        userId: existingUser?.id ?? null,
+                        email,
                         role: req.body.role,
                         status: existingUser ? "active" : "invited",
-                        revokedAt: null,
                         invitedByUserId: req.authUser!.sub,
-                        joinedAt: existingUser ? new Date() : null,
-                        updatedAt: new Date(),
+                        joinedAt: existingUser ? now : null,
                     })
-                    .where(eq(workspaceMembers.id, existingMember.id))
+                    .onConflictDoNothing()
                     .returning();
 
-                await recordAuditEvent(app.db, req.log, {
+                if (!createdMember) {
+                    throw new ConflictError("This email is already a member of the workspace");
+                }
+
+                await recordAuditEvent(tx, req.log, {
                     action: AUDIT_ACTIONS.MEMBER_INVITED,
                     actor: auditActorFromRequest(req),
-                    target: { type: AUDIT_TARGETS.MEMBER, id: reactivatedMember.id, label: email },
+                    target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
                     workspace: { id: workspace.id, name: workspace.name },
-                    metadata: { role: req.body.role, reinvitedFromRevoked: true, status: reactivatedMember.status },
+                    metadata: { role: req.body.role, status: createdMember.status },
                 });
 
-                const reactivatedMail = getWorkspaceInviteEmailContent({
-                    organizationName: workspace.name,
-                    userName: inferDisplayName(email, existingUser?.name),
-                    userEmail: email,
-                    isOwner: req.body.role === "owner",
-                });
-
-                await smtpTransport.sendMail({
-                    from: env.EMAIL_FROM ?? env.SMTP_USER,
-                    to: email,
-                    subject: reactivatedMail.subject,
-                    text: reactivatedMail.text,
-                    html: reactivatedMail.html,
-                });
-
-                return reply.status(201).send(serializeMember(reactivatedMember));
-            }
-
-            const [createdMember] = await app.db
-                .insert(workspaceMembers)
-                .values({
-                    workspaceId: workspace.id,
-                    userId: existingUser?.id ?? null,
-                    email,
-                    role: req.body.role,
-                    status: existingUser ? "active" : "invited",
-                    invitedByUserId: req.authUser!.sub,
-                    joinedAt: existingUser ? new Date() : null,
-                })
-                .onConflictDoNothing()
-                .returning();
-
-            if (!createdMember) {
-                throw new ConflictError("This email is already a member of the workspace");
-            }
-
-            await recordAuditEvent(app.db, req.log, {
-                action: AUDIT_ACTIONS.MEMBER_INVITED,
-                actor: auditActorFromRequest(req),
-                target: { type: AUDIT_TARGETS.MEMBER, id: createdMember.id, label: email },
-                workspace: { id: workspace.id, name: workspace.name },
-                metadata: { role: req.body.role, status: createdMember.status },
+                return createdMember;
             });
 
             const memberMail = getWorkspaceInviteEmailContent({
@@ -621,7 +701,7 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
                 html: memberMail.html,
             });
 
-            return reply.status(201).send(serializeMember(createdMember));
+            return reply.status(201).send(serializeMember(savedMember));
         }
     );
 
