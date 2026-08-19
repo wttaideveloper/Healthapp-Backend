@@ -350,7 +350,9 @@ function printSummary(input: {
     console.log("");
 
     console.log("WHAT THE REAL MIGRATION WOULD WRITE (not written now)");
-    const wouldWrite = [...ready, ...manualReview];
+    console.log("  This phase migrates Discover Your Health Age software only.");
+    console.log("  Venue kits and manual-review rows are reported, not written.");
+    const wouldWrite = ready;
     line("workspaces rows to INSERT", wouldWrite.length);
     line("workspace_members rows to INSERT (owner)", wouldWrite.length);
     line("Total seats granted", wouldWrite.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));

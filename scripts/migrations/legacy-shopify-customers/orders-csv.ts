@@ -110,10 +110,10 @@ function toNumber(value: string): number {
  * order-level columns are taken from the first row of the group that carries a
  * value. Rows are never merged across different order numbers.
  */
-export function readOrdersCsv(filePath: string): ParsedCsv {
-    const rows = parseCsvText(readFileSync(filePath, "utf8"));
+export function parseOrdersCsvText(input: string, sourceLabel = "csv"): ParsedCsv {
+    const rows = parseCsvText(input);
     if (rows.length === 0) {
-        throw new Error(`CSV appears to be empty: ${filePath}`);
+        throw new Error(`CSV appears to be empty: ${sourceLabel}`);
     }
 
     const headerColumns = rows[0].map((column) => column.trim());
@@ -219,6 +219,10 @@ export function readOrdersCsv(filePath: string): ParsedCsv {
         totalDataRows,
         orders: [...orders.values()],
     };
+}
+
+export function readOrdersCsv(filePath: string): ParsedCsv {
+    return parseOrdersCsvText(readFileSync(filePath, "utf8"), filePath);
 }
 
 /** Serializes a row of values into one CSV line. */

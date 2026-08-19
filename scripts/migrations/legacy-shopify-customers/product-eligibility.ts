@@ -140,6 +140,16 @@ export const GRANT_CONFIG = {
     ownerRole: "owner",
 } as const;
 
+/**
+ * This apply phase migrates software purchases only.
+ * Venue kits stay reported by the planner but are never written.
+ */
+export const APPLY_SCOPE = {
+    families: ["healthage_software"] as const,
+    createStatuses: ["ready_create_workspace"] as const,
+    emailSentMarker: "free_year_email_sent_at:",
+} as const;
+
 export type ProductMatch =
     | { readonly outcome: "eligible"; readonly rule: EligibleProductRule; readonly licenses: number | null; readonly variantNumber: number | null }
     | { readonly outcome: "ambiguous"; readonly rule: EligibleProductRule; readonly reason: string }

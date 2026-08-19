@@ -28,6 +28,16 @@ const envSchema = z.object({
     SMTP_USER: z.string().min(1),
     SMTP_PASS: z.string().min(1),
     EMAIL_FROM: z.string().min(1).optional(),
+    /** Google Play listing for Discover Your Health Age. Used by the free-year migration email. */
+    HEALTHAGE_ANDROID_URL: z.string().url().optional(),
+    /** Microsoft Store listing for Discover Your Health Age. Used by the free-year migration email. */
+    HEALTHAGE_WINDOWS_URL: z.string().url().optional(),
+    /** App Store listing. Omit from customer email until a real URL exists. */
+    HEALTHAGE_IOS_URL: z.string().url().optional(),
+    /** Mac App Store listing. Omit from customer email until a real URL exists. */
+    HEALTHAGE_MACOS_URL: z.string().url().optional(),
+    /** Customer support address for the free-year migration email. Not EMAIL_FROM. */
+    HEALTHAGE_SUPPORT_EMAIL: z.string().email().optional(),
     ADMIN_EMAILS: z.string().optional(),
     ADMIN_BOOTSTRAP_TOKEN: z.string().optional(),
     STRIPE_SECRET_KEY: z.string().min(1).optional(),

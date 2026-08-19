@@ -1,97 +1,111 @@
-# Legacy Shopify customer migration — dry run
+# Legacy Shopify customer migration
 
-One-time migration of historical Shopify customers who bought the old Health Age
-software (and qualifying venue kits) onto one year of free HealthAge access.
+One-time migration of historical Shopify customers who bought the old
+Discover Your Health Age software onto one year of free HealthAge access.
 
-**Nothing in this folder writes to the database.** The only thing implemented so
-far is the analysis and the dry-run report. The real migration is a separate,
-not-yet-written script that must be approved against a dry-run report first.
+This phase migrates **software purchases only**. Health Expo Screening Kits /
+venue kits, mixed partial-refund orders, and rows without a usable email are
+reported and skipped.
+
+Live Shopify webhook licensing in `src/modules/shopify/` is not used. Migrated
+workspaces use `billing_source = 'legacy_shopify_migration'`, which is not a
+Shopify-managed billing source.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `product-eligibility.ts` | **The reviewable configuration.** Which products qualify, how many licenses each is worth, which order states count, and how the one-year grant is represented. Nothing else contains product string checks. |
+| `product-eligibility.ts` | **The reviewable configuration.** Which products qualify, how many licenses each is worth, which order states count, and how the one-year grant is represented. |
 | `orders-csv.ts` | Reads the Shopify orders export and groups line-item rows back into orders. |
 | `build-plan.ts` | Pure CSV → per-customer plan. No database, no I/O. |
-| `dry-run.ts` | Entry point. Reads the plan, inspects existing backend state read-only, prints the summary, writes the reports. |
+| `dry-run.ts` | Read-only analysis against the CSV and (optionally) the database. |
+| `apply-core.ts` | Apply decisions, idempotency, write-mode flags, per-customer transaction helper. |
+| `apply.ts` | Apply CLI. Writes only with `--apply`. Default is dry-run (no writes, no emails). |
+| `migration-email.ts` | Free-year grant email copy. Not the live Shopify owner-welcome mail. |
+| `apply.test.ts` | Eligibility, skip, idempotency, expiry, dry-run, and email-safety tests. |
 
-## Running it
+## Dry run (no writes)
 
 CSV analysis only — no database, no `DATABASE_URL` needed:
 
 ```bash
 pnpm migrate:legacy-shopify:dry-run:csv-only
+pnpm migrate:legacy-shopify:apply --dry-run --skip-db
 ```
 
 Full dry run, including read-only checks against the backend:
 
 ```bash
 pnpm migrate:legacy-shopify:dry-run
+pnpm migrate:legacy-shopify:apply --dry-run
 ```
 
-The package script loads `.env`, whose `DATABASE_URL` points at the Docker
-service host `postgres`. From the host machine, either run it inside the
-container or pass a reachable URL:
+Limit to the first N eligible CREATE candidates:
 
 ```bash
-docker compose run --rm app pnpm migrate:legacy-shopify:dry-run
-# or
-DATABASE_URL=postgresql://healthage:...@127.0.0.1:5432/healthage \
-  npx tsx scripts/migrations/legacy-shopify-customers/dry-run.ts
+pnpm migrate:legacy-shopify:apply --dry-run --skip-db --limit=5
 ```
 
-Options:
+## Apply (writes)
 
+`--apply` is required. Without it, nothing is inserted or emailed.
+
+```bash
+pnpm migrate:legacy-shopify:apply --apply --limit=5
+pnpm migrate:legacy-shopify:apply --apply
 ```
---csv=<path>   default: orders_export_1.csv
---out=<dir>    default: migration-reports/   (gitignored: contains customer PII)
---skip-db      skip all database access
+
+If both `--apply` and `--dry-run` are passed, dry-run wins and nothing is written.
+
+## Email configuration
+
+The free-year email is sent only after that customer's workspace/membership
+transaction commits. It is not sent in dry-run.
+
+Required before mail can be sent (do not invent placeholders):
+
+```bash
+HEALTHAGE_ANDROID_URL=https://play.google.com/store/apps/details?id=com.wtt.healthAge
+HEALTHAGE_WINDOWS_URL=https://apps.microsoft.com/detail/9P8MFP2CBVL5
+HEALTHAGE_SUPPORT_EMAIL=support@healthexporesources.com
 ```
 
-## Why it cannot write
+Optional App Store links. Omit these until a real listing URL exists; the
+email will not show empty iOS or macOS rows:
 
-Two independent guarantees:
+```bash
+# HEALTHAGE_IOS_URL=
+# HEALTHAGE_MACOS_URL=
+```
 
-1. The script issues `SELECT` only.
-2. Every statement runs inside `BEGIN TRANSACTION READ ONLY`, ended with
-   `ROLLBACK`. Postgres rejects any write on that connection, so a future edit
-   that accidentally adds an `INSERT` fails loudly rather than mutating data.
+`EMAIL_FROM` is the SMTP From header and is separate from
+`HEALTHAGE_SUPPORT_EMAIL`. Do not replace `EMAIL_FROM` with the support
+address.
 
-It also creates no users, sends no email, and never touches the Shopify webhook
-path in `src/modules/shopify/`.
+The apply script also uses the Android, Windows, and support values above as
+defaults when the variables are unset. iOS and macOS have no defaults.
 
-## Output
+If no store URL and no support email can be resolved, the workspace is still
+created and the email is reported as a configuration failure. Set the
+variables in `.env` before a real send.
 
-- `migration-reports/legacy-shopify-customers-<timestamp>.csv` — one row per
-  customer: `email, customer_name, qualifying_orders, license_quantity,
-  first_purchase_date, last_purchase_date, order_numbers, products, status,
-  review_notes`.
-- `migration-reports/legacy-shopify-customers-<timestamp>.json` — the same data
-  plus per-customer backend state, skipped products, ambiguous rows, excluded
-  orders, and the `expires_at` each customer would receive.
+## Idempotency
 
-### Customer statuses
+A second run looks up workspaces by normalized owner email. If the customer
+already has an active workspace, or a workspace with
+`billing_source = 'legacy_shopify_migration'`, the row is `SKIP_EXISTING`.
+No second workspace or owner membership is created.
 
-| Status | Meaning |
-| --- | --- |
-| `ready_create_workspace` | Eligible, license count known, no conflicting backend state. |
-| `manual_review_venue_kit` | Includes a Health Expo Screening Kit, whose seat count the export does not carry. |
-| `manual_review_partial_refund` | Order is partially refunded; the export does not say which line item was refunded. |
-| `skip_existing_active_workspace` | Already has a workspace granting access. Adding a second one would change which workspace the entitlement check returns. |
-| `skip_no_qualifying_order` | Bought an eligible product, but every such order was refunded or cancelled. |
-| `blocked_missing_email` | The export has no usable email. Customers are never merged on a blank email. |
-| `blocked_ambiguous_data` | A line item matched a product by name but not by SKU, or carried an unusable quantity. |
+A successful send appends `free_year_email_sent_at:` to `workspaces.notes`.
+That marker is the email ledger; no new table is required.
 
-## How the one-year grant is represented
-
-Using the existing workspace model only — no new tables, no entitlement changes:
+## What is written
 
 ```
 workspaces          status = 'active'
                     subscription_status = 'active'
                     plan = 'organization'
-                    seat_limit = total licenses
+                    seat_limit = DYHA license total
                     expires_at = run date + 365 days
                     billing_source = 'legacy_shopify_migration'
                     is_provisioned_externally = true
@@ -101,17 +115,8 @@ workspace_members   role = 'owner'
                     status = 'active' if a user row already exists, else 'invited'
 ```
 
-`isWorkspaceAccessActive()` (`src/modules/workspace/workspace.util.ts`) already
-grants access for exactly this shape and revokes it automatically once
-`expires_at` passes — no expiry job and no code change required.
+Users are never created. `shopify_orders` is never inserted. The existing
+`linkWorkspaceMembershipsForUser()` hook claims an invited seat on register/login.
 
-`billing_source` is deliberately **not** `'shopify'`:
-`findShopifyWorkspaceIdByOwnerEmail()` in `shopify.service.ts` attaches incoming
-subscription webhooks to workspaces whose `billing_source` is exactly
-`'shopify'` and overwrites their `expires_at` and `seat_limit`. A distinct value
-keeps migrated rows out of that path and makes the entire migration selectable
-in one predicate for rollback.
-
-Members are invited by email, never created as users. The existing
-`linkWorkspaceMembershipsForUser()` hook claims the seat when the customer
-registers or logs in.
+`isWorkspaceAccessActive()` already grants access for this workspace shape and
+revokes it when `expires_at` passes.

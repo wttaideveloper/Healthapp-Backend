@@ -396,6 +396,11 @@ export function resolveGrantExpiry(customer: PlannedCustomer, runDate: Date): Da
     return expiry;
 }
 
+/** Calendar date stored/displayed for the grant window (UTC date of the Date value). */
+export function formatGrantDisplayDate(date: Date): string {
+    return date.toISOString().slice(0, 10);
+}
+
 /** Product rules, exported so the dry run can print the configuration it ran with. */
 export function describeEligibilityConfig(): string[] {
     return ELIGIBLE_PRODUCTS.map((rule) => {
