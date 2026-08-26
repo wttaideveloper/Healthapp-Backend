@@ -6,6 +6,7 @@ type LegalSection = {
 type LegalPageOptions = {
     title: string;
     sections: LegalSection[];
+    lastUpdated?: string;
     disclaimer?: string;
     contactEmail?: string;
     contactLabel?: string;
@@ -182,7 +183,7 @@ export function renderLegalPage(options: LegalPageOptions): string {
     <header>
       <p class="brand">Health Age</p>
       <h1>${escapeHtml(options.title)}</h1>
-      <p class="updated">Last updated: July 9, 2026</p>
+      <p class="updated">Last updated: ${escapeHtml(options.lastUpdated ?? "July 9, 2026")}</p>
     </header>
     ${disclaimerBlock}
     <main>
@@ -206,6 +207,7 @@ const HEALTH_DISCLAIMER =
 
 export const privacyPageHtml = renderLegalPage({
     title: "Health Age Privacy Policy",
+    lastUpdated: "August 24, 2026",
     sections: [
         {
             heading: "Introduction",
@@ -217,23 +219,35 @@ export const privacyPageHtml = renderLegalPage({
         {
             heading: "Information We Collect",
             paragraphs: [
-                "We may collect information you provide directly, such as your name, email address, account credentials, and workspace membership details.",
-                "We may also collect usage information, device identifiers, app version, operating system, and diagnostic logs needed to operate and improve the service.",
+                "We store account information on our servers when you create an account. This includes your name, email address, and account credentials (stored as a password hash), as well as workspace membership details if you belong to an organization workspace.",
+                "We also store workspace, subscription, and billing information needed to operate the service. This may include subscription status, product identifiers, renewal and expiry metadata, transaction identifiers, workspace seat assignments, and related billing records. Depending on how you purchase access, this may involve Apple, Google, Stripe, RevenueCat, or Shopify. We do not store full payment card numbers on our servers.",
+                "Health assessments are stored locally on your device, not on the Health Age backend. This includes information you enter in the app such as name used on a report, age, gender, height, weight, blood pressure, blood glucose, lifestyle questionnaire answers, calculated Health Age results, and saved reports.",
                 "If you contact support, we collect the information you choose to provide in your message.",
             ],
         },
         {
             heading: "How We Use Information",
             paragraphs: [
-                "We use collected information to create and manage your account, authenticate users, provide app features, process subscriptions, send service-related communications, and respond to support requests.",
-                "We may use aggregated or de-identified data to analyze performance, improve reliability, and enhance the user experience.",
+                "We use server-stored information to create and manage your account, authenticate users, provide app features, process subscriptions, determine whether an account has access, send service-related communications, and respond to support requests.",
+                "Health assessment information is used on your device to calculate results, display history, and generate reports you choose to save or export. We do not use Health Age backend servers to store those assessments.",
             ],
         },
         {
             heading: "Subscription Information",
             paragraphs: [
-                "Subscription and billing information may be processed by third-party providers such as Apple, Google, Stripe, or RevenueCat, depending on how you purchase access.",
+                "Subscription and billing information may be processed by third-party providers such as Apple, Google, Stripe, RevenueCat, or Shopify, depending on how you purchase access.",
                 "We receive subscription status, product identifiers, renewal information, and related metadata needed to determine whether your account has active access. We do not store full payment card numbers on our servers.",
+            ],
+        },
+        {
+            heading: "Data Retention",
+            paragraphs: [
+                "We store account information, workspace membership, and subscription and billing records on our servers so we can operate Health Age, authenticate users, and determine whether an account has access.",
+                "There is currently no automatic deletion period for this server-stored information. These records are kept until they are no longer needed to provide the service, or until we delete them as part of a manual request or operational change.",
+                "Health Age does not currently provide an in-app account deletion function. Account deletion is currently handled manually through support. If you want us to delete your account and the personal information we store on our servers, contact us at support@healthexporesources.com. Some records used for billing, security, or administrative audit purposes may remain because the current system does not automatically erase every related log or billing event.",
+                "Health assessments, calculated results, and saved reports remain on your device until you delete them in the app or uninstall the app. Files you export, such as PDFs, are stored where you choose to save them.",
+                "Password-reset codes expire after 10 minutes and can no longer be used after that time. Signed-in sessions use access tokens that expire unless you sign out sooner. Those time limits control whether a code or session still works; they are not a schedule for deleting your account records.",
+                "Third-party providers retain data according to their own policies.",
             ],
         },
         {
@@ -246,8 +260,8 @@ export const privacyPageHtml = renderLegalPage({
         {
             heading: "Third Party Services",
             paragraphs: [
-                "Health Age may rely on third-party services for authentication, hosting, analytics, email delivery, payment processing, and subscription management.",
-                "These providers process information according to their own privacy policies and only to the extent necessary to provide their services to us.",
+                "Health Age may rely on third-party services for hosting, email delivery, payment processing, and subscription management. Depending on how you use the service, this may include Apple, Google, Stripe, RevenueCat, Shopify, and our email provider.",
+                "These providers process information according to their own privacy policies and only to the extent necessary to provide their services to us. Third-party providers retain data according to their own policies.",
             ],
         },
         {
