@@ -57,6 +57,13 @@
       "when": 1786060800000,
       "tag": "0008_audit_logs",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788700800000,
+      "tag": "0009_user_status_disabled",
+      "breakpoints": true
     }
   ]
 }

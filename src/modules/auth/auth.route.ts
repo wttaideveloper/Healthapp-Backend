@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword } from "@core/security/password";
 import { env } from "@config/env";
 import { getEntitlementState, linkWorkspaceMembershipsForUser } from "@modules/entitlement/entitlement.service";
 import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
+import { isUserAllowedToAuthenticate } from "@core/auth/session";
 
 const registerBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -31,7 +32,7 @@ const authResponseSchema = z.object({
         role: z.enum(["user", "admin"]),
         hasAccess: z.boolean(),
         isEmailVerified: z.boolean(),
-        status: z.enum(["pending", "active"]),
+        status: z.enum(["pending", "active", "disabled"]),
     }),
 });
 
@@ -65,7 +66,7 @@ const meResponseSchema = z.object({
     role: z.enum(["user", "admin"]),
     hasAccess: z.boolean(),
     isEmailVerified: z.boolean(),
-    status: z.enum(["pending", "active"]),
+    status: z.enum(["pending", "active", "disabled"]),
     entitlement: z.object({
         source: z.enum(["workspace", "individual_iap", "individual_stripe"]).nullable(),
         expiresAt: z.string().datetime().nullable(),
@@ -313,13 +314,9 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
         async (req, reply) => {
             const email = sanitizeEmail(req.body.email);
 
-            const [foundUser] = await app.db
-                .select()
-                .from(users)
-                .where(and(eq(users.email, email), eq(users.status, "active")))
-                .limit(1);
+            const [foundUser] = await app.db.select().from(users).where(eq(users.email, email)).limit(1);
 
-            if (!foundUser) {
+            if (!foundUser || !isUserAllowedToAuthenticate(foundUser.status)) {
                 throw new UnauthorizedError("Invalid email or password");
             }
 

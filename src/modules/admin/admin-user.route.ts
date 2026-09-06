@@ -1,4 +1,4 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import z from "zod";
 
@@ -8,6 +8,8 @@ import { ConflictError, ForbiddenError, NotFoundError } from "@core/errors/http-
 import { hashPassword } from "@core/security/password";
 import { getEntitlementState } from "@modules/entitlement/entitlement.service";
 import { AUDIT_ACTIONS, AUDIT_TARGETS, auditActorFromRequest, recordAuditEvent } from "@modules/audit/audit.service";
+import { createDrizzleDeactivateStore, deactivateUser } from "@modules/admin/admin-user.deactivate";
+import { assertUserEligibleForAdminPromotion } from "@modules/admin/admin-user.promotion";
 
 const createAdminBodySchema = z.object({
     name: z.string().trim().min(2).max(120),
@@ -26,6 +28,14 @@ const promoteAdminBodySchema = z.object({
 function normalizeEmail(email: string): string {
     return email.trim().toLowerCase();
 }
+
+const userStatusSchema = z.enum(["pending", "active", "disabled"]);
+const idParamSchema = z.object({
+    id: z.string().uuid(),
+});
+const updateUserBodySchema = z.object({
+    status: z.literal("disabled"),
+});
 
 export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
     app.post(
@@ -76,6 +86,20 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
 
             const targetEmail = normalizeEmail(req.body.email);
 
+            const [existingUser] = await app.db
+                .select({
+                    id: users.id,
+                    email: users.email,
+                    role: users.role,
+                    status: users.status,
+                })
+                .from(users)
+                .where(eq(users.email, targetEmail))
+                .limit(1);
+
+            const target = existingUser ?? null;
+            assertUserEligibleForAdminPromotion(target);
+
             const [promotedUser] = await app.db
                 .update(users)
                 .set({
@@ -83,7 +107,7 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                     status: "active",
                     isEmailVerified: true,
                 })
-                .where(eq(users.email, targetEmail))
+                .where(and(eq(users.id, target.id), ne(users.status, "disabled")))
                 .returning({
                     id: users.id,
                     email: users.email,
@@ -91,7 +115,9 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                 });
 
             if (!promotedUser) {
-                throw new NotFoundError("User not found for this email");
+                throw new ConflictError(
+                    "This account is disabled and cannot be promoted to admin. Disabled users must be reactivated through an explicit reactivation flow before their role can change."
+                );
             }
 
             await recordAuditEvent(app.db, app.log, {
@@ -124,7 +150,7 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                             name: z.string(),
                             email: z.string().email(),
                             role: z.enum(["user", "admin"]),
-                            status: z.enum(["pending", "active"]),
+                            status: userStatusSchema,
                             hasAccess: z.boolean(),
                             isEmailVerified: z.boolean(),
                             createdAt: z.string().datetime(),
@@ -249,6 +275,45 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                 email: createdAdmin.email,
                 role: "admin",
             });
+        }
+    );
+
+    app.patch(
+        "/users/:id",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "Deactivate an individual user account",
+                params: idParamSchema,
+                body: updateUserBodySchema,
+                response: {
+                    200: z.object({
+                        id: z.string().uuid(),
+                        name: z.string(),
+                        email: z.string().email(),
+                        role: z.enum(["user", "admin"]),
+                        status: z.literal("disabled"),
+                    }),
+                },
+            },
+        },
+        async (req) => {
+            const result = await app.db.transaction(async (tx) => {
+                const store = createDrizzleDeactivateStore(tx, req.log);
+                return deactivateUser(store, {
+                    actorUserId: req.authUser!.sub,
+                    actor: auditActorFromRequest(req),
+                    targetUserId: req.params.id,
+                });
+            });
+
+            return {
+                id: result.id,
+                name: result.name,
+                email: result.email,
+                role: result.role,
+                status: result.status,
+            };
         }
     );
 };

@@ -4,7 +4,10 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 
 import { env } from "@config/env";
 import type { AuthUser, UserRole } from "@core/auth/types";
+import { assertAuthenticatedAccount } from "@core/auth/session";
 import { ForbiddenError, UnauthorizedError } from "@core/errors/http-errors";
+import { eq } from "drizzle-orm";
+import { users } from "@db/schema";
 
 async function authPluginCore(app: FastifyInstance) {
     await app.register(fastifyJwt, {
@@ -38,6 +41,15 @@ async function authPluginCore(app: FastifyInstance) {
         if (!payload || typeof payload.sub !== "string" || typeof payload.role !== "string") {
             throw new UnauthorizedError("Invalid or missing access token");
         }
+
+        // Re-check the live account. A valid JWT must not outlive deactivation.
+        const [account] = await app.db
+            .select({ status: users.status })
+            .from(users)
+            .where(eq(users.id, payload.sub))
+            .limit(1);
+
+        assertAuthenticatedAccount(account ?? null);
 
         req.authUser = payload;
     });

@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, isNull, or } from "drizzle-orm";
 import { FastifyInstance } from "fastify";
 
-import { revenuecatSubscriptions, storeEntitlements, stripeSubscriptions, workspaceMembers, workspaces } from "@db/schema";
+import { revenuecatSubscriptions, storeEntitlements, stripeSubscriptions, users, workspaceMembers, workspaces } from "@db/schema";
 import { isWorkspaceAccessActive } from "@modules/workspace/workspace.util";
 import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
 
@@ -127,8 +127,29 @@ export function selectPreferredWorkspaceAccess(
     return active[0] ?? null;
 }
 
+export const NO_ACCESS_ENTITLEMENT: EntitlementState = {
+    hasAccess: false,
+    source: null,
+    expiresAt: null,
+    providerStatus: null,
+    autoRenewing: null,
+    workspace: null,
+    individual: null,
+};
+
 export async function getEntitlementState(app: FastifyInstance, userId: string): Promise<EntitlementState> {
     const now = new Date();
+
+    const [account] = await app.db
+        .select({ status: users.status })
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
+
+    // Deactivated accounts keep billing rows, but must not unlock the app.
+    if (!account || account.status === "disabled") {
+        return { ...NO_ACCESS_ENTITLEMENT };
+    }
 
     // Workspace access wins over individual purchases so organization users never see paywalls.
     // Prefer an active workspace; a cancelled/expired row must not shadow a valid one.
@@ -234,13 +255,5 @@ export async function getEntitlementState(app: FastifyInstance, userId: string):
         };
     }
 
-    return {
-        hasAccess: false,
-        source: null,
-        expiresAt: null,
-        providerStatus: null,
-        autoRenewing: null,
-        workspace: null,
-        individual: null,
-    };
+    return { ...NO_ACCESS_ENTITLEMENT };
 }

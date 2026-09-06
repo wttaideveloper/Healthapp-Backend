@@ -6,7 +6,7 @@ export type UserId = Brand<string, "UserId">;
 
 /* ---------- Domain Enums ---------- */
 export const UserRoleValues = ["user", "admin"] as const;
-export const UserStatusValues = ["pending", "active"] as const;
+export const UserStatusValues = ["pending", "active", "disabled"] as const;
 
 export type UserStatus = typeof UserStatusValues[number];
 export type UserRole = typeof UserRoleValues[number];

@@ -9,15 +9,14 @@ import { auditLogs } from "@db/schema";
  * business logic is not reshaped around auditing.
  *
  * FAILURE POLICY — deliberate and important:
- * `recordAuditEvent` never throws. An audit insert failing must not turn a
- * successful workspace creation into a 500 for the administrator who performed
- * it. Failures are logged at `error` level so they surface in normal log
- * monitoring instead of disappearing.
+ * `recordAuditEvent` never throws by default. An audit insert failing must not
+ * turn a successful workspace creation into a 500 for the administrator who
+ * performed it. Failures are logged at `error` level so they surface in normal
+ * log monitoring instead of disappearing.
  *
- * The trade-off is explicit: this is a best-effort trail, not a
- * write-ahead-guaranteed compliance ledger. If a deployment ever needs the
- * stronger guarantee, pass the surrounding transaction as `db` and drop the
- * try/catch — the call sites do not change. See the deliverable notes.
+ * Destructive account changes (user deactivation) pass `throwOnFailure: true`
+ * so a failed audit write rolls back the surrounding transaction instead of
+ * leaving an unlogged deactivation.
  */
 
 /** Anything that can execute an insert: the pooled db or an open transaction. */
@@ -36,6 +35,7 @@ export const AUDIT_ACTIONS = {
 
     ADMIN_CREATED: "admin.created",
     ADMIN_PROMOTED: "admin.promoted",
+    USER_DEACTIVATED: "user.deactivated",
 
     WORKSPACE_CREATED: "workspace.created",
     WORKSPACE_UPDATED: "workspace.updated",
@@ -83,6 +83,12 @@ export type AuditEventInput = {
     workspace?: { id?: string | null; name?: string | null } | null;
     result?: "success" | "failure";
     metadata?: Record<string, unknown> | null;
+    /**
+     * When true, a failed insert rethrows so a surrounding transaction can
+     * roll back. Default stays best-effort so unrelated admin writes are not
+     * failed by the audit trail.
+     */
+    throwOnFailure?: boolean;
 };
 
 /** Pulls the signed-in actor off the request. Null when unauthenticated. */
@@ -100,9 +106,10 @@ function asUuidOrNull(value: string | null | undefined): string | null {
 }
 
 /**
- * Writes one audit row. Never throws.
+ * Writes one audit row.
  *
  * @param db  Pooled db, or a transaction to tie the record to the same commit.
+ * By default this never throws. Pass `throwOnFailure: true` to fail the caller.
  */
 export async function recordAuditEvent(
     db: AuditExecutor,
@@ -125,6 +132,7 @@ export async function recordAuditEvent(
         });
     } catch (error) {
         log.error({ err: error, action: input.action }, "Failed to write audit log entry");
+        if (input.throwOnFailure) throw error;
     }
 }
 
