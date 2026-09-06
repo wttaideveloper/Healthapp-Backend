@@ -23,6 +23,14 @@ import {
     buildAuditChangeSet,
     recordAuditEvent,
 } from "@modules/audit/audit.service";
+import {
+    createDrizzlePermanentDeleteMemberStore,
+    permanentlyDeleteMember,
+} from "@modules/admin/admin-member.permanent-delete";
+import {
+    createDrizzlePermanentDeleteWorkspaceStore,
+    permanentlyDeleteWorkspace,
+} from "@modules/admin/admin-workspace.permanent-delete";
 
 const idParamSchema = z.object({
     id: z.string().uuid(),
@@ -63,6 +71,32 @@ const addMemberBodySchema = z.object({
 const updateMemberBodySchema = z.object({
     role: z.enum(workspaceRoles).optional(),
     status: z.enum(workspaceMemberStatuses).optional(),
+});
+
+const permanentDeleteMemberBodySchema = z.object({
+    confirmation: z.string().min(1),
+});
+
+const permanentDeleteMemberResponseSchema = z.object({
+    deleted: z.literal(true),
+    id: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+    email: z.string().email(),
+    role: z.string(),
+    status: z.string(),
+    userId: z.string().uuid().nullable(),
+});
+
+const permanentDeleteWorkspaceBodySchema = z.object({
+    confirmation: z.string().min(1),
+});
+
+const permanentDeleteWorkspaceResponseSchema = z.object({
+    deleted: z.literal(true),
+    id: z.string().uuid(),
+    name: z.string(),
+    billingSource: z.string(),
+    deletedMemberCount: z.number().int(),
 });
 
 const shopifyAdminOrderProductSchema = z.object({
@@ -596,6 +630,41 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
     );
 
     app.post(
+        "/workspaces/:id/permanent-delete",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "Permanently delete a manual workspace",
+                description:
+                    "Removes the workspace and its member seats. Does not revoke: PATCH status=revoked remains a soft revoke. Shopify-managed or Shopify-linked workspaces are blocked. Does not delete users, billing, Shopify commerce rows, or audit history.",
+                params: idParamSchema,
+                body: permanentDeleteWorkspaceBodySchema,
+                response: {
+                    200: permanentDeleteWorkspaceResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const deleted = await app.db.transaction(async (tx) => {
+                const store = createDrizzlePermanentDeleteWorkspaceStore(tx, req.log);
+                return permanentlyDeleteWorkspace(store, {
+                    actor: auditActorFromRequest(req),
+                    workspaceId: req.params.id,
+                    confirmation: req.body.confirmation,
+                });
+            });
+
+            return {
+                deleted: true as const,
+                id: deleted.id,
+                name: deleted.name,
+                billingSource: deleted.billingSource,
+                deletedMemberCount: deleted.deletedMemberCount,
+            };
+        }
+    );
+
+    app.post(
         "/workspaces/:id/members",
         {
             preHandler: app.authorize(["admin"]),
@@ -760,6 +829,44 @@ export const adminWorkspaceRoutes: FastifyPluginAsyncZod = async (app) => {
             }
 
             return serializeMember(updatedMember);
+        }
+    );
+
+    app.post(
+        "/workspaces/:id/members/:memberId/permanent-delete",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "Permanently delete a workspace member row",
+                description:
+                    "Removes only the workspace_members row. Does not revoke-or-deactivate: the existing DELETE endpoint remains a soft revoke. Does not delete the user account, workspace, billing, or audit history.",
+                params: memberIdParamSchema,
+                body: permanentDeleteMemberBodySchema,
+                response: {
+                    200: permanentDeleteMemberResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const deleted = await app.db.transaction(async (tx) => {
+                const store = createDrizzlePermanentDeleteMemberStore(tx, req.log);
+                return permanentlyDeleteMember(store, {
+                    actor: auditActorFromRequest(req),
+                    workspaceId: req.params.id,
+                    memberId: req.params.memberId,
+                    confirmation: req.body.confirmation,
+                });
+            });
+
+            return {
+                deleted: true as const,
+                id: deleted.id,
+                workspaceId: deleted.workspaceId,
+                email: deleted.email,
+                role: deleted.role,
+                status: deleted.status,
+                userId: deleted.userId,
+            };
         }
     );
 

@@ -14,9 +14,9 @@ import { auditLogs } from "@db/schema";
  * performed it. Failures are logged at `error` level so they surface in normal
  * log monitoring instead of disappearing.
  *
- * Destructive account changes (user deactivation) pass `throwOnFailure: true`
- * so a failed audit write rolls back the surrounding transaction instead of
- * leaving an unlogged deactivation.
+ * Destructive account changes (user deactivation, permanent deletes) pass
+ * `throwOnFailure: true` so a failed audit write rolls back the surrounding
+ * transaction instead of leaving an unlogged destructive change.
  */
 
 /** Anything that can execute an insert: the pooled db or an open transaction. */
@@ -36,10 +36,12 @@ export const AUDIT_ACTIONS = {
     ADMIN_CREATED: "admin.created",
     ADMIN_PROMOTED: "admin.promoted",
     USER_DEACTIVATED: "user.deactivated",
+    USER_PERMANENTLY_DELETED: "user.permanently_deleted",
 
     WORKSPACE_CREATED: "workspace.created",
     WORKSPACE_UPDATED: "workspace.updated",
     WORKSPACE_REVOKED: "workspace.revoked",
+    WORKSPACE_PERMANENTLY_DELETED: "workspace.permanently_deleted",
     WORKSPACE_SUBSCRIPTION_CHANGED: "workspace.subscription_changed",
     WORKSPACE_PROVISIONED_SHOPIFY: "workspace.provisioned_shopify",
     WORKSPACE_LICENSES_UPDATED_SHOPIFY: "workspace.licenses_updated_shopify",
@@ -50,6 +52,7 @@ export const AUDIT_ACTIONS = {
     MEMBER_ROLE_CHANGED: "member.role_changed",
     MEMBER_RESTORED: "member.restored",
     MEMBER_REMOVED: "member.removed",
+    MEMBER_PERMANENTLY_DELETED: "member.permanently_deleted",
     INVITATION_REVOKED: "invitation.revoked",
 } as const;
 

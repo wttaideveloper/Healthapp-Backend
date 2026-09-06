@@ -9,6 +9,10 @@ import { hashPassword } from "@core/security/password";
 import { getEntitlementState } from "@modules/entitlement/entitlement.service";
 import { AUDIT_ACTIONS, AUDIT_TARGETS, auditActorFromRequest, recordAuditEvent } from "@modules/audit/audit.service";
 import { createDrizzleDeactivateStore, deactivateUser } from "@modules/admin/admin-user.deactivate";
+import {
+    createDrizzlePermanentDeleteUserStore,
+    permanentlyDeleteUser,
+} from "@modules/admin/admin-user.permanent-delete";
 import { assertUserEligibleForAdminPromotion } from "@modules/admin/admin-user.promotion";
 
 const createAdminBodySchema = z.object({
@@ -35,6 +39,15 @@ const idParamSchema = z.object({
 });
 const updateUserBodySchema = z.object({
     status: z.literal("disabled"),
+});
+const permanentDeleteUserBodySchema = z.object({
+    confirmation: z.string().min(1),
+});
+const permanentDeleteUserResponseSchema = z.object({
+    deleted: z.literal(true),
+    id: z.string().uuid(),
+    email: z.string().email(),
+    name: z.string(),
 });
 
 export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
@@ -313,6 +326,41 @@ export const adminUserRoutes: FastifyPluginAsyncZod = async (app) => {
                 email: result.email,
                 role: result.role,
                 status: result.status,
+            };
+        }
+    );
+
+    app.post(
+        "/users/:id/permanent-delete",
+        {
+            preHandler: app.authorize(["admin"]),
+            schema: {
+                summary: "Permanently delete an individual user account",
+                description:
+                    "Removes a deactivated user who has no remaining workspace or billing relationships. Does not deactivate: PATCH status=disabled remains a soft deactivation. Does not delete workspaces, memberships, billing events, Shopify rows, or audit history.",
+                params: idParamSchema,
+                body: permanentDeleteUserBodySchema,
+                response: {
+                    200: permanentDeleteUserResponseSchema,
+                },
+            },
+        },
+        async (req) => {
+            const deleted = await app.db.transaction(async (tx) => {
+                const store = createDrizzlePermanentDeleteUserStore(tx, req.log);
+                return permanentlyDeleteUser(store, {
+                    actorUserId: req.authUser!.sub,
+                    actor: auditActorFromRequest(req),
+                    targetUserId: req.params.id,
+                    confirmation: req.body.confirmation,
+                });
+            });
+
+            return {
+                deleted: true as const,
+                id: deleted.id,
+                email: deleted.email,
+                name: deleted.name,
             };
         }
     );
