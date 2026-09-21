@@ -189,7 +189,6 @@ export const stripeRoutes: FastifyPluginAsyncZod = async (app) => {
                 line_items: [{ price: priceId, quantity: 1 }],
                 success_url: successUrl,
                 cancel_url: cancelUrl,
-                allow_promotion_codes: true,
                 metadata: {
                     userId,
                     source: "web",
