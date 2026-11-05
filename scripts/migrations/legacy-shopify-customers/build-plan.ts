@@ -27,7 +27,6 @@ export const CUSTOMER_STATUSES = [
     "blocked_ambiguous_data",
     "skip_no_qualifying_order",
     "skip_existing_active_workspace",
-    "manual_review_venue_kit",
     "manual_review_partial_refund",
     "ready_create_workspace",
 ] as const;
@@ -52,6 +51,7 @@ export type AmbiguousRow = {
     readonly reason: string;
 };
 
+/** One venue kit line item in an order that qualified on its own merits. */
 export type VenueKitPurchase = {
     readonly orderNumber: string;
     readonly shopifyOrderId: string;
@@ -59,9 +59,19 @@ export type VenueKitPurchase = {
     readonly customerName: string;
     readonly product: string;
     readonly quantity: number;
+    readonly licenses: number;
     readonly unitPrice: string;
     readonly createdAt: string;
-    readonly reason: string;
+    /** What happens to the purchaser: `ready_create_workspace`, or why not. */
+    readonly customerStatus: CustomerStatus;
+};
+
+export type MatchedProduct = {
+    readonly rule: EligibleProductRule;
+    readonly quantity: number;
+    /** `null` only for an ambiguous line, whose license count is unknown. */
+    readonly licenses: number | null;
+    readonly unitPrice: string;
 };
 
 export type OrderEvaluation = {
@@ -71,9 +81,21 @@ export type OrderEvaluation = {
     readonly exclusionReason: string | null;
     readonly licenses: number;
     /** Eligible products found, whether or not the order qualified. */
-    readonly matchedProducts: readonly { rule: EligibleProductRule; quantity: number; licenses: number | null }[];
+    readonly matchedProducts: readonly MatchedProduct[];
     readonly hasVenueKit: boolean;
     readonly hasSoftware: boolean;
+};
+
+/** Licenses a set of customers would receive from one product. */
+export type ProductLicenseTotals = {
+    readonly ruleId: string;
+    readonly label: string;
+    readonly family: ProductFamily;
+    readonly customers: number;
+    readonly orders: number;
+    /** Sum of line-item quantities (units purchased). */
+    readonly units: number;
+    readonly licenses: number;
 };
 
 export type PlannedCustomer = {
@@ -144,9 +166,20 @@ function pickWorstStatus(statuses: readonly CustomerStatus[]): CustomerStatus {
     return "ready_create_workspace";
 }
 
+/**
+ * True when the order has been partly refunded and the export cannot say which
+ * line was refunded. Besides Shopify's own `partially_refunded` status this
+ * catches a `paid` order carrying a Refunded Amount, where status and amount
+ * disagree. Either way the refund allocation is not guessed.
+ */
+export function isPartiallyRefunded(order: Pick<ParsedOrder, "financialStatus" | "refundedAmount">): boolean {
+    const status = order.financialStatus.trim().toLowerCase();
+    return status === "partially_refunded" || (status === "paid" && order.refundedAmount > 0);
+}
+
 /** Evaluates one order: which eligible products it holds and whether it qualifies. */
 function evaluateOrder(order: ParsedOrder, ambiguousRows: AmbiguousRow[]): OrderEvaluation | null {
-    const matchedProducts: { rule: EligibleProductRule; quantity: number; licenses: number | null }[] = [];
+    const matchedProducts: MatchedProduct[] = [];
     let licenses = 0;
     let sawAmbiguity = false;
 
@@ -169,14 +202,12 @@ function evaluateOrder(order: ParsedOrder, ambiguousRows: AmbiguousRow[]): Order
                 lineItemName: lineItem.name,
                 reason: match.reason,
             });
-            matchedProducts.push({ rule: match.rule, quantity: lineItem.quantity, licenses: null });
+            matchedProducts.push({ rule: match.rule, quantity: lineItem.quantity, licenses: null, unitPrice: lineItem.price });
             continue;
         }
 
-        matchedProducts.push({ rule: match.rule, quantity: lineItem.quantity, licenses: match.licenses });
-        if (match.licenses !== null) {
-            licenses += match.licenses;
-        }
+        matchedProducts.push({ rule: match.rule, quantity: lineItem.quantity, licenses: match.licenses, unitPrice: lineItem.price });
+        licenses += match.licenses;
     }
 
     if (matchedProducts.length === 0) return null;
@@ -214,7 +245,9 @@ function evaluateOrder(order: ParsedOrder, ambiguousRows: AmbiguousRow[]): Order
  */
 export function buildMigrationPlan(csv: ParsedCsv): MigrationPlan {
     const ambiguousRows: AmbiguousRow[] = [];
-    const venueKitPurchases: VenueKitPurchase[] = [];
+    // Kit lines are collected while orders are evaluated; their customer status is only
+    // known once orders have been grouped by purchaser, so it is attached at the end.
+    const pendingVenueKitPurchases: Omit<VenueKitPurchase, "customerStatus">[] = [];
     const excludedOrders: { orderNumber: string; email: string; reason: string }[] = [];
     const skippedProducts = new Map<string, { lineItemName: string; sku: string; rowCount: number; totalQuantity: number }>();
 
@@ -258,21 +291,17 @@ export function buildMigrationPlan(csv: ParsedCsv): MigrationPlan {
         }
 
         for (const product of evaluation.matchedProducts) {
-            if (product.rule.family !== "venue_kit" || !evaluation.qualifies) continue;
-            const kitLineItem = order.lineItems.find((lineItem) => product.rule.lineItemPattern.test(lineItem.name.trim()));
-            venueKitPurchases.push({
+            if (product.rule.family !== "venue_kit" || !evaluation.qualifies || product.licenses === null) continue;
+            pendingVenueKitPurchases.push({
                 orderNumber: order.orderNumber,
                 shopifyOrderId: order.shopifyOrderId,
                 email: normalizeEmail(order.email),
                 customerName: order.customerName,
                 product: product.rule.label,
                 quantity: product.quantity,
-                unitPrice: kitLineItem?.price ?? "",
+                licenses: product.licenses,
+                unitPrice: product.unitPrice,
                 createdAt: order.createdAt,
-                reason:
-                    product.rule.licenseQuantity.type === "manual_confirmation_required"
-                        ? product.rule.licenseQuantity.reason
-                        : "Venue kit seat count requires confirmation",
             });
         }
 
@@ -311,15 +340,11 @@ export function buildMigrationPlan(csv: ParsedCsv): MigrationPlan {
             statuses.push("skip_no_qualifying_order");
         }
 
-        if (qualifying.some((evaluation) => evaluation.hasVenueKit)) {
-            statuses.push("manual_review_venue_kit");
-            reviewNotes.push("Includes a Health Expo Screening Kit; its license count is not present in the export and must be confirmed.");
-        }
-
-        if (qualifying.some((evaluation) => evaluation.order.financialStatus.toLowerCase() === "partially_refunded")) {
+        const partiallyRefunded = qualifying.filter((evaluation) => isPartiallyRefunded(evaluation.order));
+        if (partiallyRefunded.length > 0) {
             statuses.push("manual_review_partial_refund");
             reviewNotes.push(
-                "Order is partially refunded; the export reports one refund total for the whole order and does not say which line item was refunded."
+                `Order ${partiallyRefunded.map((evaluation) => evaluation.order.orderNumber).join(", ")} is partially refunded; the export reports one refund total for the whole order and does not say which line item was refunded. The whole customer is held for manual review rather than guessing the refund allocation.`
             );
         }
 
@@ -371,6 +396,17 @@ export function buildMigrationPlan(csv: ParsedCsv): MigrationPlan {
 
     customers.sort((left, right) => left.email.localeCompare(right.email) || left.orderNumbers[0].localeCompare(right.orderNumbers[0]));
 
+    const statusByOrderNumber = new Map<string, CustomerStatus>();
+    for (const customer of customers) {
+        for (const evaluation of customer.evaluations) {
+            statusByOrderNumber.set(evaluation.order.orderNumber, customer.status);
+        }
+    }
+    const venueKitPurchases: VenueKitPurchase[] = pendingVenueKitPurchases.map((purchase) => ({
+        ...purchase,
+        customerStatus: statusByOrderNumber.get(purchase.orderNumber) ?? "blocked_ambiguous_data",
+    }));
+
     return {
         totalCsvRows: csv.totalDataRows,
         totalOrders: csv.orders.length,
@@ -407,9 +443,41 @@ export function describeEligibilityConfig(): string[] {
         const quantity =
             rule.licenseQuantity.type === "variant_number"
                 ? "licenses = N from the title x quantity"
-                : rule.licenseQuantity.type === "fixed_per_unit"
-                  ? `licenses = ${rule.licenseQuantity.seatsPerUnit} x quantity`
-                  : "licenses = UNKNOWN (manual confirmation required)";
+                : `licenses = ${rule.licenseQuantity.seatsPerUnit} x quantity`;
         return `${rule.label}  [sku ${rule.expectedSkus.join("/") || "n/a"}]  ->  ${quantity}`;
+    });
+}
+
+/**
+ * Licenses per product across the given customers.
+ *
+ * Counts qualifying orders only, so passing the `ready_create_workspace`
+ * customers yields exactly the product mix behind the seat total that would be
+ * written. Every configured product is listed, including those at zero.
+ */
+export function summarizeLicensesByProduct(customers: readonly PlannedCustomer[]): ProductLicenseTotals[] {
+    return ELIGIBLE_PRODUCTS.map((rule) => {
+        let customerCount = 0;
+        let orders = 0;
+        let units = 0;
+        let licenses = 0;
+
+        for (const customer of customers) {
+            let customerHasProduct = false;
+            for (const evaluation of customer.evaluations) {
+                if (!evaluation.qualifies) continue;
+                const lines = evaluation.matchedProducts.filter((product) => product.rule.id === rule.id);
+                if (lines.length === 0) continue;
+                customerHasProduct = true;
+                orders++;
+                for (const line of lines) {
+                    units += line.quantity;
+                    licenses += line.licenses ?? 0;
+                }
+            }
+            if (customerHasProduct) customerCount++;
+        }
+
+        return { ruleId: rule.id, label: rule.label, family: rule.family, customers: customerCount, orders, units, licenses };
     });
 }

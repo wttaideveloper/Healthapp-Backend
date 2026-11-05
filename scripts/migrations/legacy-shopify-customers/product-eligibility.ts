@@ -24,13 +24,13 @@ export type LicenseQuantityRule =
      *   "Discover Your Health Age - 4", quantity 2 => 8 licenses
      */
     | { readonly type: "variant_number"; readonly multipliedByQuantity: true }
-    /** A fixed number of seats per unit purchased. Not used yet — kept for venue kits once confirmed. */
-    | { readonly type: "fixed_per_unit"; readonly seatsPerUnit: number }
     /**
-     * The CSV carries no seat count for this product. The migration must not
-     * guess: these purchases are reported separately for a human decision.
+     * A fixed number of licenses per unit purchased, multiplied by the line-item
+     * quantity. The count is business-confirmed, not derivable from the export.
+     *   Small Venue Kit x3 => 1 x 3 = 3 licenses
+     *   Large Venue Kit x2 => 4 x 2 = 8 licenses
      */
-    | { readonly type: "manual_confirmation_required"; readonly reason: string };
+    | { readonly type: "fixed_per_unit"; readonly seatsPerUnit: number };
 
 export type ProductFamily = "healthage_software" | "venue_kit";
 
@@ -42,9 +42,10 @@ export type EligibleProductRule = {
     /** Matched against the trimmed `Lineitem name` column. */
     readonly lineItemPattern: RegExp;
     /**
-     * SKUs this product is expected to carry in the export. A name match with an
-     * unexpected SKU is reported as ambiguous rather than silently accepted,
-     * because it usually means the catalogue changed under us.
+     * SKUs that identify this product in the export. When a line item carries a
+     * SKU, the SKU is authoritative (see `matchLineItem`): the title is only
+     * cross-checked against it, never trusted on its own. A SKU/title
+     * disagreement is reported as ambiguous instead of being accepted or dropped.
      * Empty array = the export carries no SKU for this product (do not check).
      */
     readonly expectedSkus: readonly string[];
@@ -58,6 +59,9 @@ export type EligibleProductRule = {
  * license count; the pattern captures it. The variant list is open-ended on
  * purpose (`\d+`), so "- 5", "- 10" and future tiers work without a code change
  * even though this particular export only contains N = 1..4.
+ *
+ * Venue kits (client-confirmed): the Shopify title is "Health Expo Screening
+ * Kits - English / <size>". A kit is worth a fixed number of licenses per unit.
  */
 export const ELIGIBLE_PRODUCTS: readonly EligibleProductRule[] = [
     {
@@ -70,25 +74,19 @@ export const ELIGIBLE_PRODUCTS: readonly EligibleProductRule[] = [
     },
     {
         id: "health_expo_screening_kit_small",
-        label: "Health Expo Screening Kits - English / Small",
+        label: "Small Venue Kit (Health Expo Screening Kits - English / Small)",
         family: "venue_kit",
         lineItemPattern: /^health expo screening kits\s*[-–]\s*english\s*\/\s*small$/i,
         expectedSkus: ["004-1"],
-        licenseQuantity: {
-            type: "manual_confirmation_required",
-            reason: "The export carries no seat count for venue kits: the variant is a size (Small), not a number, and Lineitem quantity is the number of kits shipped, not licenses.",
-        },
+        licenseQuantity: { type: "fixed_per_unit", seatsPerUnit: 1 },
     },
     {
         id: "health_expo_screening_kit_large",
-        label: "Health Expo Screening Kits - English / Large",
+        label: "Large Venue Kit (Health Expo Screening Kits - English / Large)",
         family: "venue_kit",
         lineItemPattern: /^health expo screening kits\s*[-–]\s*english\s*\/\s*large$/i,
         expectedSkus: ["004-2"],
-        licenseQuantity: {
-            type: "manual_confirmation_required",
-            reason: "The export carries no seat count for venue kits: the variant is a size (Large), not a number, and Lineitem quantity is the number of kits shipped, not licenses.",
-        },
+        licenseQuantity: { type: "fixed_per_unit", seatsPerUnit: 4 },
     },
 ] as const;
 
@@ -99,12 +97,20 @@ export const ELIGIBLE_PRODUCTS: readonly EligibleProductRule[] = [
  * order, so these are evaluated against the order after line items are grouped.
  */
 export const ORDER_ELIGIBILITY = {
-    /** Financial statuses that still represent money kept by the merchant. */
+    /**
+     * Financial statuses that still represent money kept by the merchant.
+     * Everything else (`refunded`, `voided`, `pending`, …) is excluded, so fully
+     * refunded orders never grant access.
+     */
     eligibleFinancialStatuses: ["paid", "partially_refunded"] as const,
     /**
-     * `partially_refunded` orders are eligible but flagged: the export shows one
-     * refund total for the whole order and never says which line was refunded,
-     * so we cannot tell whether the refund covered the HealthAge line item.
+     * `partially_refunded` orders are held for manual review, never migrated: the
+     * export shows one refund total for the whole order and never says which line
+     * was refunded, so we cannot tell whether the refund covered a HealthAge
+     * software or venue kit line. Refund allocation is not guessed.
+     *
+     * The same applies to a `paid` order that nevertheless carries a non-zero
+     * Refunded Amount: the status and the amount disagree, which is ambiguous.
      */
     flagPartiallyRefundedForReview: true,
     /** Cancelled orders never grant access, regardless of financial status. */
@@ -141,26 +147,61 @@ export const GRANT_CONFIG = {
 } as const;
 
 /**
- * This apply phase migrates software purchases only.
- * Venue kits stay reported by the planner but are never written.
+ * What the apply phase is allowed to create.
+ *
+ * Both product families are in scope: Discover Your Health Age software and the
+ * Small / Large Venue Kits. Orders held for manual review (partial refunds,
+ * ambiguous lines) and customers with no usable email are never created
+ * regardless of family — that is decided by `createStatuses`.
  */
 export const APPLY_SCOPE = {
-    families: ["healthage_software"] as const,
+    families: ["healthage_software", "venue_kit"] as const,
     createStatuses: ["ready_create_workspace"] as const,
     emailSentMarker: "free_year_email_sent_at:",
 } as const;
 
 export type ProductMatch =
-    | { readonly outcome: "eligible"; readonly rule: EligibleProductRule; readonly licenses: number | null; readonly variantNumber: number | null }
+    | { readonly outcome: "eligible"; readonly rule: EligibleProductRule; readonly licenses: number; readonly variantNumber: number | null }
     | { readonly outcome: "ambiguous"; readonly rule: EligibleProductRule; readonly reason: string }
     | { readonly outcome: "skipped" };
+
+function ambiguous(rule: EligibleProductRule, reason: string): ProductMatch {
+    return { outcome: "ambiguous", rule, reason };
+}
+
+/** Licenses for a line item once the product itself has been identified. */
+function resolveLicenses(rule: EligibleProductRule, titleMatch: RegExpExecArray, name: string, quantity: number): ProductMatch {
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+        return ambiguous(rule, `Line item "${name}" has an unusable quantity (${quantity})`);
+    }
+
+    if (rule.licenseQuantity.type === "variant_number") {
+        const variantNumber = Number(titleMatch[1]);
+        if (!Number.isInteger(variantNumber) || variantNumber <= 0) {
+            return ambiguous(rule, `Could not read a license count from the product title "${name}"`);
+        }
+        return { outcome: "eligible", rule, licenses: variantNumber * quantity, variantNumber };
+    }
+
+    return { outcome: "eligible", rule, licenses: rule.licenseQuantity.seatsPerUnit * quantity, variantNumber: null };
+}
 
 /**
  * Resolves one CSV line item against the eligibility table.
  *
- * Returns `licenses: null` for products whose seat count the CSV does not carry
- * (venue kits) — null means "unknown", which is different from zero and is what
- * keeps those purchases out of the license total instead of quietly adding 0.
+ * Identification is SKU-first. When the line item carries a SKU, the SKU decides
+ * which product it is and the title is only a cross-check:
+ *   - SKU is a known eligible SKU and the title agrees  -> eligible
+ *   - SKU is a known eligible SKU but the title does not -> ambiguous (a human looks)
+ *   - SKU is unknown but the title looks eligible        -> ambiguous (catalogue drift)
+ *   - SKU is unknown and the title is unrelated          -> skipped
+ * Only when the SKU is blank does the title alone decide.
+ *
+ * "Ambiguous" fails closed: the order is excluded and listed in the report. It
+ * is never silently accepted and never silently dropped.
+ *
+ * An unusable quantity (zero, negative, fractional) is ambiguous for every
+ * product. The license count is never guessed.
  */
 export function matchLineItem(input: {
     lineItemName: string;
@@ -168,55 +209,35 @@ export function matchLineItem(input: {
     quantity: number;
 }): ProductMatch {
     const name = input.lineItemName.trim();
+    const sku = input.sku.trim();
 
-    for (const rule of ELIGIBLE_PRODUCTS) {
-        const match = rule.lineItemPattern.exec(name);
-        if (!match) continue;
+    const titleRule = ELIGIBLE_PRODUCTS.find((rule) => rule.lineItemPattern.test(name));
 
-        const sku = input.sku.trim();
-        if (rule.expectedSkus.length > 0 && sku.length > 0 && !rule.expectedSkus.includes(sku)) {
-            return {
-                outcome: "ambiguous",
-                rule,
-                reason: `SKU "${sku}" does not match the expected SKU(s) ${rule.expectedSkus.join(", ")} for "${rule.label}"`,
-            };
-        }
+    if (sku.length > 0) {
+        const skuRule = ELIGIBLE_PRODUCTS.find((rule) => rule.expectedSkus.includes(sku));
 
-        if (rule.licenseQuantity.type === "variant_number") {
-            const variantNumber = Number(match[1]);
-            if (!Number.isInteger(variantNumber) || variantNumber <= 0) {
-                return {
-                    outcome: "ambiguous",
-                    rule,
-                    reason: `Could not read a license count from the product title "${name}"`,
-                };
+        if (skuRule) {
+            const titleMatch = skuRule.lineItemPattern.exec(name);
+            if (!titleMatch) {
+                return ambiguous(
+                    skuRule,
+                    `SKU "${sku}" identifies "${skuRule.label}" but the line item title "${name}" does not match the expected title`
+                );
             }
-            if (!Number.isInteger(input.quantity) || input.quantity <= 0) {
-                return {
-                    outcome: "ambiguous",
-                    rule,
-                    reason: `Line item "${name}" has an unusable quantity (${input.quantity})`,
-                };
-            }
-            return {
-                outcome: "eligible",
-                rule,
-                licenses: variantNumber * input.quantity,
-                variantNumber,
-            };
+            return resolveLicenses(skuRule, titleMatch, name, input.quantity);
         }
 
-        if (rule.licenseQuantity.type === "fixed_per_unit") {
-            return {
-                outcome: "eligible",
-                rule,
-                licenses: rule.licenseQuantity.seatsPerUnit * Math.max(input.quantity, 1),
-                variantNumber: null,
-            };
+        if (titleRule && titleRule.expectedSkus.length > 0) {
+            return ambiguous(
+                titleRule,
+                `SKU "${sku}" does not match the expected SKU(s) ${titleRule.expectedSkus.join(", ")} for "${titleRule.label}"`
+            );
         }
-
-        return { outcome: "eligible", rule, licenses: null, variantNumber: null };
     }
 
-    return { outcome: "skipped" };
+    if (!titleRule) return { outcome: "skipped" };
+
+    const titleMatch = titleRule.lineItemPattern.exec(name);
+    if (!titleMatch) return { outcome: "skipped" };
+    return resolveLicenses(titleRule, titleMatch, name, input.quantity);
 }

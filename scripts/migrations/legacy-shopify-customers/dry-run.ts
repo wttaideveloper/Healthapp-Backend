@@ -23,7 +23,14 @@ import { resolve } from "node:path";
 import { Pool } from "pg";
 
 import { readOrdersCsv, toCsvLine } from "./orders-csv";
-import { buildMigrationPlan, describeEligibilityConfig, resolveGrantExpiry, type MigrationPlan, type PlannedCustomer } from "./build-plan";
+import {
+    buildMigrationPlan,
+    describeEligibilityConfig,
+    resolveGrantExpiry,
+    summarizeLicensesByProduct,
+    type MigrationPlan,
+    type PlannedCustomer,
+} from "./build-plan";
 import { GRANT_CONFIG } from "./product-eligibility";
 
 type Args = {
@@ -289,9 +296,11 @@ function printSummary(input: {
 
     console.log("CUSTOMERS");
     line("Total customers with eligible purchases", decisions.length);
-    line("Total eligible customers (migratable)", migratable.length);
+    line("Customers READY to create (will be written)", ready.length);
+    line("Licenses for customers READY to create", ready.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));
+    line("Eligible customers (ready + manual review)", migratable.length);
+    line("Licenses for those customers", migratable.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));
     line("Total licenses across all eligible orders", decisions.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));
-    line("Total licenses for migratable customers", migratable.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));
     line("Customers with multiple qualifying purchases", multiPurchase.length);
     line("Invalid / missing emails", decisions.length - identifiable.length);
     console.log("");
@@ -319,13 +328,13 @@ function printSummary(input: {
     }
     console.log("");
 
-    console.log(`VENUE KIT PURCHASES REQUIRING MANUAL CONFIRMATION (${plan.venueKitPurchases.length})`);
+    console.log(`VENUE KIT PURCHASES IN QUALIFYING ORDERS (${plan.venueKitPurchases.length})`);
     for (const kit of plan.venueKitPurchases) {
-        console.log(`  ${kit.orderNumber}  ${kit.email.padEnd(34)} ${kit.product}  qty ${kit.quantity} @ ${kit.unitPrice}  (${kit.createdAt.slice(0, 10)})`);
+        console.log(
+            `  ${kit.orderNumber}  ${kit.email.padEnd(34)} ${kit.product.split(" (")[0]}  qty ${kit.quantity} = ${String(kit.licenses).padStart(2)} lic  (${kit.createdAt.slice(0, 10)})  -> ${kit.customerStatus}`
+        );
     }
-    if (plan.venueKitPurchases.length > 0) {
-        console.log("  -> The export carries no seat count for these. Confirm licenses-per-kit before the real run.");
-    }
+    if (plan.venueKitPurchases.length === 0) console.log("  none");
     console.log("");
 
     console.log(`AMBIGUOUS ROWS (${plan.ambiguousRows.length})`);
@@ -349,13 +358,25 @@ function printSummary(input: {
     if (blocked.length === 0) console.log("  none");
     console.log("");
 
-    console.log("WHAT THE REAL MIGRATION WOULD WRITE (not written now)");
-    console.log("  This phase migrates Discover Your Health Age software only.");
-    console.log("  Venue kits and manual-review rows are reported, not written.");
     const wouldWrite = ready;
+    console.log("LICENSES BY PRODUCT (customers that would be created)");
+    const byProduct = summarizeLicensesByProduct(wouldWrite.map((decision) => decision.customer));
+    for (const product of byProduct) {
+        console.log(
+            `  ${product.label.padEnd(66)} customers ${String(product.customers).padStart(3)}  orders ${String(product.orders).padStart(3)}  units ${String(product.units).padStart(3)}  licenses ${String(product.licenses).padStart(3)}`
+        );
+    }
+    line("Total licenses (all products)", byProduct.reduce((total, product) => total + product.licenses, 0));
+    console.log("");
+
+    console.log("WHAT THE REAL MIGRATION WOULD WRITE (not written now)");
+    console.log("  One organization per purchaser email: Discover Your Health Age, Small Venue Kit and");
+    console.log("  Large Venue Kit licenses are combined. The purchaser becomes the organization owner/admin.");
+    console.log("  Manual-review, blocked and refunded customers are reported, not written.");
     line("workspaces rows to INSERT", wouldWrite.length);
     line("workspace_members rows to INSERT (owner)", wouldWrite.length);
     line("Total seats granted", wouldWrite.reduce((total, decision) => total + decision.customer.licenseQuantity, 0));
+    line("Held for manual review (not written)", manualReview.length);
     line("Grant window", `${GRANT_CONFIG.accessDurationDays} days from ${GRANT_CONFIG.grantStartsFrom}`);
     line("expires_at that would be written", wouldWrite[0] ? resolveGrantExpiry(wouldWrite[0].customer, runDate).toISOString() : "n/a");
     line("billing_source", GRANT_CONFIG.workspaceBillingSource);
@@ -409,6 +430,9 @@ async function main(): Promise<void> {
                     eligibleOrders: plan.eligibleOrders,
                     customers: plan.customers.length,
                 },
+                licensesByProduct: summarizeLicensesByProduct(
+                    decisions.filter((decision) => decision.status === "ready_create_workspace").map((decision) => decision.customer)
+                ),
                 skippedProducts: plan.skippedProducts,
                 ambiguousRows: plan.ambiguousRows,
                 venueKitPurchases: plan.venueKitPurchases,

@@ -316,13 +316,15 @@ Workspace creation and member addition send SMTP emails:
 - workspace owner/admin adds workspace member
 - revoked member is re-added
 
-The invite email tells users to visit:
+The invite email tells users to visit the HealthAge Admin / Workspace Admin portal:
 
 ```text
-https://health-age-admin.vercel.app/workspace-admin
+https://healthage.healthexporesources.com/
 ```
 
 and sign in or create an account with the invited email. Matching invited memberships are activated automatically on login/register.
+
+The address is defined once, as `WORKSPACE_ADMIN_URL` in `src/modules/workspace/workspace.links.ts`, and is used by every invite, organization-welcome and Shopify owner-welcome email.
 
 ## Common Troubleshooting
 

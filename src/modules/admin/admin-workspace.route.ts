@@ -16,6 +16,7 @@ import {
     workspaceSubscriptionStatuses,
 } from "@modules/workspace/workspace.util";
 import { assertWorkspaceHasAvailableSeat, countNonRevokedWorkspaceSeats } from "@modules/workspace/workspace.seats";
+import { WORKSPACE_ADMIN_URL } from "@modules/workspace/workspace.links";
 import {
     AUDIT_ACTIONS,
     AUDIT_TARGETS,
@@ -197,7 +198,7 @@ You’ve been added to the Pro account for ${input.organizationName} on “Disco
 ${introRoleLine}
 
 To get started:
-1. Visit: https://health-age-admin.vercel.app/workspace-admin
+1. Visit: ${WORKSPACE_ADMIN_URL}
 2. Download the app for your device (iPhone, Android, Windows, or Mac)
 3. Sign in using this email address: ${input.userEmail}
 4. If you don’t already have an account, create one using this email address
@@ -208,7 +209,7 @@ To get started:
 <p>${introRoleLine}</p>
 <p>To get started:</p>
 <ol>
-<li>Visit: <a href="https://health-age-admin.vercel.app/workspace-admin">https://health-age-admin.vercel.app/workspace-admin</a></li>
+<li>Visit: <a href="${WORKSPACE_ADMIN_URL}">${WORKSPACE_ADMIN_URL}</a></li>
 <li>Download the app for your device (iPhone, Android, Windows, or Mac)</li>
 <li>Sign in using this email address: <strong>${input.userEmail}</strong></li>
 <li>If you don’t already have an account, create one using this email address</li>

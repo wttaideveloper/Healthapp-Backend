@@ -8,6 +8,8 @@
 import { APPLY_SCOPE, GRANT_CONFIG } from "./product-eligibility";
 import {
     formatGrantDisplayDate,
+    isUsableEmail,
+    normalizeEmail,
     resolveGrantExpiry,
     type CustomerStatus,
     type PlannedCustomer,
@@ -40,6 +42,7 @@ export type ExistingUser = { readonly id: string; readonly email: string; readon
 
 export type ApplyWriteMode = {
     readonly writesEnabled: boolean;
+    /** Never true unless writes are enabled: dry-run and `--no-email` both force it off. */
     readonly emailsEnabled: boolean;
 };
 
@@ -75,21 +78,46 @@ export const DEFAULT_HEALTHAGE_WINDOWS_URL = "https://apps.microsoft.com/detail/
 /** Canonical customer support address. Not EMAIL_FROM. */
 export const DEFAULT_HEALTHAGE_SUPPORT_EMAIL = "support@healthexporesources.com";
 
-export function resolveWriteMode(input: { apply: boolean; dryRun: boolean }): ApplyWriteMode {
+/**
+ * Writes need `--apply` and no `--dry-run`. Emails additionally need the absence
+ * of `--no-email`, so a run can create the workspaces now and leave the free-year
+ * email until the store links are approved.
+ */
+export function resolveWriteMode(input: {
+    apply: boolean;
+    dryRun: boolean;
+    noEmail?: boolean;
+    onlyEmails?: readonly string[];
+}): ApplyWriteMode {
     const writesEnabled = input.apply === true && input.dryRun !== true;
+    // A targeted run must not email from stage 1: stage 2 owns sending (advisory lock, ledger,
+    // its own recipient allowlist), and a pilot is exactly where that must not be bypassed.
+    if (writesEnabled && (input.onlyEmails?.length ?? 0) > 0 && input.noEmail !== true) {
+        throw new Error(
+            "--only-emails with --apply requires --no-email: the pilot email is sent by stage 2 (send-emails.ts), which has the advisory lock, the email ledger and its own recipient allowlist."
+        );
+    }
     return {
         writesEnabled,
-        emailsEnabled: writesEnabled,
+        emailsEnabled: writesEnabled && input.noEmail !== true,
     };
 }
 
+/**
+ * Unrecognised arguments are rejected rather than ignored. Safety now hangs on
+ * flags like `--no-email`; a typo (`--no-emial`) that was silently dropped would
+ * send real mail.
+ */
 export function parseApplyArgs(argv: readonly string[]): {
     csvPath: string;
     outDir: string;
     skipDb: boolean;
     apply: boolean;
     dryRun: boolean;
+    noEmail: boolean;
     limit: number | null;
+    /** Exact recipient allowlist (normalized, de-duplicated). Empty = not supplied = no targeting. */
+    onlyEmails: string[];
 } {
     const args = {
         csvPath: "orders_export_1.csv",
@@ -97,13 +125,18 @@ export function parseApplyArgs(argv: readonly string[]): {
         skipDb: false,
         apply: false,
         dryRun: false,
+        noEmail: false,
         limit: null as number | null,
     };
+    let onlyEmails: string[] | null = null;
 
     for (const argument of argv) {
+        // pnpm forwards a literal "--" separator to the script; it carries no meaning.
+        if (argument === "--") continue;
         if (argument === "--skip-db") args.skipDb = true;
         else if (argument === "--apply") args.apply = true;
         else if (argument === "--dry-run") args.dryRun = true;
+        else if (argument === "--no-email") args.noEmail = true;
         else if (argument.startsWith("--csv=")) args.csvPath = argument.slice("--csv=".length);
         else if (argument.startsWith("--out=")) args.outDir = argument.slice("--out=".length);
         else if (argument.startsWith("--limit=")) {
@@ -112,17 +145,61 @@ export function parseApplyArgs(argv: readonly string[]): {
                 throw new Error(`Invalid --limit value: ${argument}`);
             }
             args.limit = parsed;
+        } else if (argument.startsWith("--only-emails=")) {
+            if (onlyEmails !== null) throw new Error("--only-emails was given more than once");
+            onlyEmails = parseEmailAllowlist("--only-emails", argument.slice("--only-emails=".length));
+        } else {
+            throw new Error(
+                `Unknown argument: ${argument}. Supported: --apply, --dry-run, --no-email, --skip-db, --csv=, --out=, --limit=, --only-emails=a@x.com,b@y.com`
+            );
         }
     }
 
-    return args;
+    if (onlyEmails !== null && args.limit !== null) {
+        throw new Error("--only-emails and --limit cannot be combined: the listed addresses ARE the scope.");
+    }
+
+    return { ...args, onlyEmails: onlyEmails ?? [] };
 }
 
-export function isWorkspaceAccessActive(workspace: Pick<ExistingWorkspace, "status" | "subscription_status" | "expires_at">): boolean {
+/**
+ * Parses an exact-recipient allowlist such as `--only-emails=a@x.com,B@y.com`.
+ *
+ * Addresses are trimmed, lower-cased and de-duplicated; nothing else is folded (no
+ * plus-alias or dot handling, no wildcards, no domain matching). Anything unusable is
+ * an ERROR, never a shrug: an allowlist that silently became empty or smaller must not
+ * widen into "everyone". A forgotten comma ("a@x.com b@y.com") is rejected for the same
+ * reason.
+ */
+export function parseEmailAllowlist(flag: string, value: string): string[] {
+    const addresses = value
+        .split(",")
+        .map((entry) => normalizeEmail(entry))
+        .filter((entry) => entry.length > 0);
+
+    if (addresses.length === 0) {
+        throw new Error(`${flag} needs at least one address, e.g. ${flag}=customer@example.com`);
+    }
+    for (const address of addresses) {
+        if (!isUsableEmail(address)) throw new Error(`${flag} contains an invalid address: ${address}`);
+    }
+    return [...new Set(addresses)];
+}
+
+type AccessShape = Pick<ExistingWorkspace, "status" | "subscription_status" | "expires_at">;
+
+/** `isWorkspaceAccessActive` against an explicit clock, so callers and tests are not tied to "now". */
+export function isWorkspaceAccessActiveAt(workspace: AccessShape, nowMs: number): boolean {
     if (workspace.status !== "active") return false;
     if (!["active", "trialing"].includes(workspace.subscription_status)) return false;
     if (!workspace.expires_at) return true;
-    return workspace.expires_at.getTime() > Date.now();
+    return workspace.expires_at.getTime() > nowMs;
+}
+
+// Single-argument on purpose: it is passed straight to Array#filter, which would hand
+// an optional second parameter the element index.
+export function isWorkspaceAccessActive(workspace: AccessShape): boolean {
+    return isWorkspaceAccessActiveAt(workspace, Date.now());
 }
 
 export function isLegacyMigrationWorkspace(workspace: Pick<ExistingWorkspace, "billing_source">): boolean {
@@ -133,8 +210,13 @@ export function notesIndicateFreeYearEmailSent(notes: string | null | undefined)
     return (notes ?? "").includes(APPLY_SCOPE.emailSentMarker);
 }
 
+/** The single line the email ledger stores in `workspaces.notes`. One format for both stages. */
+export function buildFreeYearEmailSentMarker(sentAt: Date): string {
+    return `${APPLY_SCOPE.emailSentMarker} ${sentAt.toISOString()}`;
+}
+
 export function appendFreeYearEmailSentMarker(notes: string, sentAt: Date): string {
-    const marker = `${APPLY_SCOPE.emailSentMarker} ${sentAt.toISOString()}`;
+    const marker = buildFreeYearEmailSentMarker(sentAt);
     if (notesIndicateFreeYearEmailSent(notes)) return notes;
     return notes.trim().length > 0 ? `${notes.trim()}\n${marker}` : marker;
 }
@@ -147,10 +229,13 @@ export function mapPlanStatusToAction(status: CustomerStatus | string): ApplyAct
     return "SKIP_MANUAL_REVIEW";
 }
 
+/**
+ * A customer may be created only when the planner marked them ready, they hold at
+ * least one in-scope product family, and there is at least one license to grant.
+ */
 export function isThisPhaseCreateCandidate(customer: PlannedCustomer): boolean {
     if (!(APPLY_SCOPE.createStatuses as readonly string[]).includes(customer.status)) return false;
     if (!APPLY_SCOPE.families.some((family) => customer.families.includes(family))) return false;
-    if (customer.families.includes("venue_kit")) return false;
     if (customer.licenseQuantity <= 0) return false;
     return true;
 }
@@ -242,8 +327,17 @@ export function decideCustomer(input: {
         );
     }
 
-    if (action === "CREATE" && input.customer.families.includes("venue_kit")) {
-        notes.push("This phase does not migrate venue kits.");
+    // An earlier migration run may have granted fewer seats than the plan now totals
+    // (for example a software-only run before venue kits were added). Apply never
+    // edits an existing workspace, so surface the difference for a human instead.
+    if (input.dbChecked && action === "SKIP_EXISTING") {
+        for (const workspace of legacyWorkspaces) {
+            if (workspace.seat_limit !== input.customer.licenseQuantity) {
+                notes.push(
+                    `Existing ${GRANT_CONFIG.workspaceBillingSource} workspace ${workspace.id} has ${workspace.seat_limit} seat(s) but the plan totals ${input.customer.licenseQuantity}. Apply does not change existing workspaces; adjust the seat limit by hand if the difference is intended to be granted.`
+                );
+            }
+        }
     }
 
     return {
@@ -282,6 +376,124 @@ export function applyCreateLimit(decisions: readonly ApplyDecision[], limit: num
     });
 }
 
+// ---------------------------------------------------------------------------
+// Exact recipient targeting (--only-emails)
+// ---------------------------------------------------------------------------
+
+export type TargetState =
+    /** Will be created by this run. */
+    | "eligible"
+    /**
+     * Already has a workspace, so nothing is created and a re-run is safe. It may be this
+     * migration's workspace OR a live one (e.g. from the Shopify webhook): the detail says
+     * which, because stage 2 only emails migration workspaces.
+     */
+    | "has_workspace"
+    /** In the plan but held or refused (refund, manual review, ...): cannot be migrated. */
+    | "blocked"
+    /** Not in the plan at all: no order for this exact address contains an eligible product. */
+    | "missing";
+
+export type TargetEntry = { readonly email: string; readonly state: TargetState; readonly detail: string };
+
+export type TargetReport = {
+    readonly requested: readonly string[];
+    readonly entries: readonly TargetEntry[];
+    readonly eligible: readonly TargetEntry[];
+    readonly hasWorkspace: readonly TargetEntry[];
+    /** Blocked + missing. A write run is refused while this is non-empty. */
+    readonly unresolved: readonly TargetEntry[];
+};
+
+/**
+ * Says, for every requested address, exactly what a run would do with it. Matching is
+ * exact on the normalized address: no aliases, no wildcards, no partial matches.
+ */
+export function buildTargetReport(decisions: readonly ApplyDecision[], onlyEmails: readonly string[]): TargetReport {
+    const requested = [...new Set(onlyEmails.map(normalizeEmail))];
+
+    const entries = requested.map((email): TargetEntry => {
+        const decision = decisions.find((candidate) => candidate.customer.email !== "" && candidate.customer.email === email);
+        if (!decision) {
+            return {
+                email,
+                state: "missing",
+                detail: "not in the migration plan: no order for this exact address contains an eligible product (check the spelling and the CSV)",
+            };
+        }
+        if (decision.action === "CREATE") {
+            return { email, state: "eligible", detail: `will create a workspace with ${decision.customer.licenseQuantity} licence(s)` };
+        }
+        if (decision.action === "SKIP_EXISTING") {
+            return {
+                email,
+                state: "has_workspace",
+                detail: decision.reviewNotes.find((note) => note.startsWith("Already has")) ?? "already has a workspace; nothing to create",
+            };
+        }
+        return {
+            email,
+            state: "blocked",
+            detail: `${decision.action}${decision.reviewNotes[0] ? `: ${decision.reviewNotes[0]}` : ""}`,
+        };
+    });
+
+    return {
+        requested,
+        entries,
+        eligible: entries.filter((entry) => entry.state === "eligible"),
+        hasWorkspace: entries.filter((entry) => entry.state === "has_workspace"),
+        unresolved: entries.filter((entry) => entry.state === "blocked" || entry.state === "missing"),
+    };
+}
+
+/**
+ * A write run must be able to act on, or find already done, EVERY address it was given.
+ * One typo or one held customer refuses the whole run before anything is written, so a
+ * pilot never half-happens and a mistyped address is never quietly dropped.
+ */
+export function assertTargetActionable(report: TargetReport): void {
+    if (report.unresolved.length === 0) return;
+    throw new Error(
+        `--only-emails names ${report.unresolved.length} address(es) that cannot be migrated, so NOTHING was written:\n` +
+            report.unresolved.map((entry) => `  ${entry.email}  [${entry.state}] ${entry.detail}`).join("\n")
+    );
+}
+
+/**
+ * Marks as `inThisRun` ONLY the CREATE decisions whose address is on the list. Everyone
+ * else, including every other eligible customer, is explicitly left out.
+ */
+export function applyEmailAllowlist(decisions: readonly ApplyDecision[], onlyEmails: readonly string[]): ApplyDecision[] {
+    const allowed = new Set(onlyEmails.map(normalizeEmail));
+    return decisions.map((decision) => ({
+        ...decision,
+        inThisRun: decision.action === "CREATE" && decision.customer.email !== "" && allowed.has(normalizeEmail(decision.customer.email)),
+    }));
+}
+
+/**
+ * The single place the apply CLI turns decisions into "what runs now". With an allowlist
+ * it NEVER falls back to the limit/all behaviour: it either targets exactly the listed
+ * addresses or throws.
+ */
+export function selectDecisions(input: {
+    decided: readonly ApplyDecision[];
+    limit: number | null;
+    onlyEmails: readonly string[];
+    writesEnabled: boolean;
+}): { decisions: ApplyDecision[]; targeting: TargetReport | null } {
+    if (input.onlyEmails.length === 0) {
+        return { decisions: applyCreateLimit(input.decided, input.limit), targeting: null };
+    }
+    if (input.limit !== null) {
+        throw new Error("--only-emails and --limit cannot be combined: the listed addresses ARE the scope.");
+    }
+    const targeting = buildTargetReport(input.decided, input.onlyEmails);
+    if (input.writesEnabled) assertTargetActionable(targeting);
+    return { decisions: applyEmailAllowlist(input.decided, input.onlyEmails), targeting };
+}
+
 export function summarizeDecisions(decisions: readonly ApplyDecision[]): {
     create: number;
     createThisRun: number;
@@ -289,7 +501,8 @@ export function summarizeDecisions(decisions: readonly ApplyDecision[]): {
     skipMissingEmail: number;
     skipRefunded: number;
     skipManualReview: number;
-    skipVenueKit: number;
+    /** CREATE decisions whose purchaser bought at least one venue kit. */
+    createWithVenueKit: number;
     licensesThisRun: number;
     licensesEligible: number;
 } {
@@ -302,7 +515,7 @@ export function summarizeDecisions(decisions: readonly ApplyDecision[]): {
         skipMissingEmail: decisions.filter((decision) => decision.action === "SKIP_MISSING_EMAIL").length,
         skipRefunded: decisions.filter((decision) => decision.action === "SKIP_REFUNDED").length,
         skipManualReview: decisions.filter((decision) => decision.action === "SKIP_MANUAL_REVIEW").length,
-        skipVenueKit: decisions.filter((decision) => decision.customer.families.includes("venue_kit")).length,
+        createWithVenueKit: create.filter((decision) => decision.customer.families.includes("venue_kit")).length,
         licensesThisRun: createThisRun.reduce((total, decision) => total + decision.customer.licenseQuantity, 0),
         licensesEligible: create.reduce((total, decision) => total + decision.customer.licenseQuantity, 0),
     };
@@ -324,6 +537,8 @@ export type ApplyExecutor = {
         workspaceId: string;
         userId: string | null;
         email: string;
+        /** The purchaser's role: the organization owner/admin. Decided here, not in SQL. */
+        role: string;
         status: "active" | "invited";
         joinedAt: Date | null;
     }): Promise<void>;
@@ -352,6 +567,11 @@ export async function applyOneCustomer(input: {
     decision: ApplyDecision;
     writeMode: ApplyWriteMode;
     emailConfig: EmailConfig;
+    /**
+     * Exact recipient allowlist (normalized). When given, a customer that is not on it is
+     * never written, whatever the decision says: a second lock on top of `selectDecisions`.
+     */
+    onlyEmails?: ReadonlySet<string>;
     sendEmail: (payload: {
         to: string;
         customerName: string;
@@ -367,7 +587,9 @@ export async function applyOneCustomer(input: {
 }): Promise<CustomerApplyResult> {
     const { customer, decision, writeMode, emailConfig } = input;
 
-    if (decision.action !== "CREATE" || !decision.inThisRun) {
+    const outsideAllowlist = input.onlyEmails !== undefined && !input.onlyEmails.has(normalizeEmail(customer.email));
+
+    if (decision.action !== "CREATE" || !decision.inThisRun || outsideAllowlist) {
         return {
             email: customer.email,
             action: decision.action,
@@ -433,6 +655,7 @@ export async function applyOneCustomer(input: {
                     workspaceId: workspace.id,
                     userId: user?.id ?? null,
                     email: customer.email,
+                    role: GRANT_CONFIG.ownerRole,
                     status,
                     joinedAt: user ? now : null,
                 });

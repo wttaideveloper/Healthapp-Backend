@@ -1,11 +1,19 @@
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { isShopifyManagedLicensingWorkspace } from "../../../src/modules/shopify/shopify.license.ts";
+import { hasAvailableWorkspaceSeat } from "../../../src/modules/workspace/workspace.seats.ts";
 import { GRANT_CONFIG, matchLineItem } from "./product-eligibility.ts";
 import { parseOrdersCsvText, readOrdersCsv, toCsvLine } from "./orders-csv.ts";
-import { buildMigrationPlan, formatGrantDisplayDate, resolveGrantExpiry } from "./build-plan.ts";
+import {
+    buildMigrationPlan,
+    formatGrantDisplayDate,
+    isPartiallyRefunded,
+    resolveGrantExpiry,
+    summarizeLicensesByProduct,
+} from "./build-plan.ts";
 import {
     applyCreateLimit,
     applyOneCustomer,
@@ -19,6 +27,8 @@ import {
     resolveWriteMode,
     summarizeDecisions,
     type ApplyExecutor,
+    type ApplyWriteMode,
+    type ExistingUser,
     type ExistingWorkspace,
     type TransactionRunner,
 } from "./apply-core.ts";
@@ -48,6 +58,7 @@ const HEADER = [
     "Billing Name",
     "Refunded Amount",
     "Paid at",
+    "Billing Company",
 ];
 
 type FixtureRow = Partial<Record<(typeof HEADER)[number], string>>;
@@ -77,12 +88,110 @@ function planFrom(rows: FixtureRow[]) {
     return buildMigrationPlan(parseOrdersCsvText(csvFrom(rows)));
 }
 
+/** Line items, as the Shopify export writes them (title + SKU). */
+const dyha = (variant: number, quantity = 1): FixtureRow => ({
+    "Lineitem name": `Discover Your Health Age - ${variant}`,
+    "Lineitem sku": "008",
+    "Lineitem quantity": String(quantity),
+});
+const smallKit = (quantity = 1): FixtureRow => ({
+    "Lineitem name": "Health Expo Screening Kits - English / Small",
+    "Lineitem sku": "004-1",
+    "Lineitem quantity": String(quantity),
+});
+const largeKit = (quantity = 1): FixtureRow => ({
+    "Lineitem name": "Health Expo Screening Kits - English / Large",
+    "Lineitem sku": "004-2",
+    "Lineitem quantity": String(quantity),
+});
+const unrelated = (name: string, sku = ""): FixtureRow => ({ "Lineitem name": name, "Lineitem sku": sku });
+
+/**
+ * One order as the export writes it: order-level columns on the first row only,
+ * continuation rows carry just the order name and their own line item.
+ */
+function order(input: {
+    name: string;
+    email: string;
+    id: string;
+    lines: FixtureRow[];
+    status?: string;
+    refunded?: string;
+    cancelledAt?: string;
+    billingName?: string;
+    company?: string;
+}): FixtureRow[] {
+    return input.lines.map((line, index) => ({
+        ...line,
+        Name: input.name,
+        ...(index === 0
+            ? {
+                  Email: input.email,
+                  Id: input.id,
+                  "Financial Status": input.status ?? "paid",
+                  "Refunded Amount": input.refunded ?? "0.00",
+                  "Cancelled at": input.cancelledAt ?? "",
+                  "Billing Name": input.billingName ?? "",
+                  "Billing Company": input.company ?? "",
+              }
+            : {}),
+    }));
+}
+
+const NO_EMAIL_MODE: ApplyWriteMode = { writesEnabled: true, emailsEnabled: false };
+const APPLY_MODE: ApplyWriteMode = { writesEnabled: true, emailsEnabled: true };
+
+/**
+ * Mirrors the CLI: decisions are taken from a snapshot of the database at the start
+ * of the run, then each customer is applied. `emails` records every send attempt.
+ */
+async function runApply(input: {
+    db: ReturnType<typeof createMemoryDb>;
+    plan: ReturnType<typeof planFrom>;
+    runDate: Date;
+    writeMode: ApplyWriteMode;
+    users?: ExistingUser[];
+    limit?: number | null;
+}) {
+    const emails: string[] = [];
+    const decisions = applyCreateLimit(
+        input.plan.customers.map((customer) =>
+            decideCustomer({
+                customer,
+                runDate: input.runDate,
+                user: input.users?.find((user) => user.email === customer.email),
+                workspaces: customer.email ? input.db.workspaces.filter((workspace) => workspace.owner_email === customer.email) : [],
+                dbChecked: true,
+            })
+        ),
+        input.limit ?? null
+    );
+    const results = [];
+    for (const decision of decisions) {
+        results.push(
+            await applyOneCustomer({
+                runner: input.db.runner,
+                notesWriter: input.db.executor,
+                customer: decision.customer,
+                decision,
+                writeMode: input.writeMode,
+                emailConfig: TEST_EMAIL_CONFIG,
+                sendEmail: async (payload) => {
+                    emails.push(payload.to);
+                },
+                now: input.runDate,
+            })
+        );
+    }
+    return { decisions, results, emails };
+}
+
 function createMemoryDb(seed?: { users?: { id: string; email: string; name: string }[]; workspaces?: ExistingWorkspace[] }) {
     let workspaceSeq = 1;
     let memberSeq = 1;
     const users = [...(seed?.users ?? [])];
     const workspaces: ExistingWorkspace[] = [...(seed?.workspaces ?? [])];
-    const members: Array<{ id: string; workspaceId: string; email: string; status: string }> = [];
+    const members: Array<{ id: string; workspaceId: string; userId: string | null; email: string; role: string; status: string }> = [];
     let writeCount = 0;
 
     const clone = <T>(value: T): T => structuredClone(value);
@@ -119,7 +228,9 @@ function createMemoryDb(seed?: { users?: { id: string; email: string; name: stri
             members.push({
                 id: `mem-${memberSeq++}`,
                 workspaceId: values.workspaceId,
+                userId: values.userId,
                 email: values.email,
+                role: values.role,
                 status: values.status,
             });
         },
@@ -231,7 +342,7 @@ describe("legacy Shopify customer grouping and skips", () => {
         assert.equal(mapPlanStatusToAction(plan.customers[0]!.status), "SKIP_REFUNDED");
     });
 
-    it("venue kit is not migrated", () => {
+    it("a paid venue kit order is migrated with its fixed license count", () => {
         const plan = planFrom([
             {
                 Name: "#1435",
@@ -241,16 +352,16 @@ describe("legacy Shopify customer grouping and skips", () => {
                 "Lineitem sku": "004-2",
             },
         ]);
-        assert.equal(plan.customers[0]?.status, "manual_review_venue_kit");
+        assert.equal(plan.customers[0]?.status, "ready_create_workspace");
         assert.equal(
             resolveApplyAction({
                 customer: plan.customers[0]!,
                 hasActiveWorkspace: false,
                 hasLegacyMigrationWorkspace: false,
             }),
-            "SKIP_MANUAL_REVIEW"
+            "CREATE"
         );
-        assert.equal(plan.customers[0]?.licenseQuantity, 0);
+        assert.equal(plan.customers[0]?.licenseQuantity, 4);
     });
 
     it("partial refund mixed order is skipped for manual review", () => {
@@ -272,7 +383,7 @@ describe("legacy Shopify customer grouping and skips", () => {
                 "Lineitem sku": "008",
             },
         ]);
-        assert.equal(plan.customers[0]?.status, "manual_review_venue_kit");
+        assert.equal(plan.customers[0]?.status, "manual_review_partial_refund");
         assert.equal(
             resolveApplyAction({
                 customer: plan.customers[0]!,
@@ -343,7 +454,8 @@ describe("legacy Shopify apply decisions", () => {
                     subscription_status: "active",
                     plan: "organization",
                     seat_limit: 4,
-                    expires_at: new Date("2027-01-01T00:00:00.000Z"),
+                    // Far future: "active" is judged against the real clock.
+                    expires_at: new Date("2099-01-01T00:00:00.000Z"),
                     billing_source: "shopify",
                     notes: null,
                 },
@@ -661,6 +773,14 @@ describe("legacy Shopify apply decisions", () => {
                 "Lineitem name": "Health Expo Screening Kits - English / Small",
                 "Lineitem sku": "004-1",
             },
+            {
+                Name: "#5",
+                Email: "partial@example.com",
+                Id: "19",
+                "Financial Status": "partially_refunded",
+                "Refunded Amount": "10.00",
+                "Lineitem name": "Discover Your Health Age - 1",
+            },
         ]);
         const runDate = new Date("2026-08-16T00:00:00.000Z");
         const decided = plan.customers.map((customer) =>
@@ -668,11 +788,11 @@ describe("legacy Shopify apply decisions", () => {
         );
         const limited = applyCreateLimit(decided, 1);
         const summary = summarizeDecisions(limited);
-        assert.equal(summary.create, 2);
+        assert.equal(summary.create, 3);
         assert.equal(summary.createThisRun, 1);
         assert.equal(summary.skipMissingEmail, 1);
         assert.equal(summary.skipManualReview, 1);
-        assert.equal(summary.skipVenueKit, 1);
+        assert.equal(summary.createWithVenueKit, 1);
         assert.equal(limited.filter((decision) => decision.inThisRun).length, 1);
     });
 });
@@ -691,6 +811,15 @@ describe("legacy free-year email", () => {
         assert.match(content.text, /Pastor Rodney Bowes/);
         assert.doesNotMatch(content.text, /workspace-admin/);
         assert.doesNotMatch(content.subject, /Workspace Admin/);
+
+        // The live owner-welcome email links to the Workspace Admin portal. The free-year email
+        // is a different message and carries no admin link, whichever address that link uses.
+        // (The retired address contained "workspace-admin"; the current one does not, so the
+        // portal host must be checked explicitly to keep detecting reuse of that copy.)
+        for (const body of [content.text, content.html]) {
+            assert.doesNotMatch(body, /healthage\.healthexporesources\.com/);
+            assert.doesNotMatch(body, /Visit:/);
+        }
     });
 
     it("includes Android and Windows store links when configured", () => {
@@ -802,9 +931,733 @@ describe("legacy free-year email", () => {
 describe("Shopify live licensing isolation", () => {
     it("legacy_shopify_migration is not Shopify-managed licensing", () => {
         assert.equal(GRANT_CONFIG.workspaceBillingSource, "legacy_shopify_migration");
-        assert.equal(GRANT_CONFIG.workspaceBillingSource === "shopify", false);
+        assert.equal((GRANT_CONFIG.workspaceBillingSource as string) === "shopify", false);
         assert.equal(isShopifyManagedLicensingWorkspace("shopify"), true);
         assert.equal(isShopifyManagedLicensingWorkspace("legacy_shopify_migration"), false);
         assert.equal(isShopifyManagedLicensingWorkspace("manual"), false);
+    });
+
+    const migrationDir = resolve(process.cwd(), "scripts/migrations/legacy-shopify-customers");
+    const sourceFiles = readdirSync(migrationDir).filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"));
+    const importsOf = (file: string): string[] =>
+        [...readFileSync(join(migrationDir, file), "utf8").matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((match) => match[1]!);
+
+    it("migration scripts import nothing from the application src/ tree, so the webhook flow is never on their path", () => {
+        assert.ok(sourceFiles.length >= 10, "expected the migration source files to be found");
+        for (const file of sourceFiles) {
+            for (const specifier of importsOf(file)) {
+                assert.doesNotMatch(specifier, /(^|\/)src\//, `${file} imports ${specifier}`);
+                assert.doesNotMatch(specifier, /^@(modules|db|core|plugins|config)\//, `${file} imports ${specifier}`);
+                assert.doesNotMatch(specifier, /shopify\.(service|route|admin)/, `${file} imports ${specifier}`);
+            }
+        }
+    });
+
+    it("planning and apply-decision modules are pure: no database driver and no mail transport", () => {
+        for (const file of [
+            "product-eligibility.ts",
+            "orders-csv.ts",
+            "build-plan.ts",
+            "apply-core.ts",
+            "migration-email.ts",
+            "send-emails-core.ts",
+            "email-transport.ts",
+        ]) {
+            for (const specifier of importsOf(file)) {
+                assert.notEqual(specifier, "pg", `${file} must not import pg`);
+                assert.notEqual(specifier, "nodemailer", `${file} must not import nodemailer`);
+            }
+        }
+    });
+});
+
+describe("venue kit license calculation (line-item quantity × licenses per unit)", () => {
+    const licensesFor = (name: string, sku: string, quantity: number): number => {
+        const match = matchLineItem({ lineItemName: name, sku, quantity });
+        assert.equal(match.outcome, "eligible", `${name} x${quantity} should be eligible`);
+        return match.outcome === "eligible" ? match.licenses : -1;
+    };
+
+    it("Discover Your Health Age (SKU 008): variant licenses × quantity", () => {
+        assert.equal(licensesFor("Discover Your Health Age - 1", "008", 1), 1);
+        assert.equal(licensesFor("Discover Your Health Age - 1", "008", 3), 3);
+        assert.equal(licensesFor("Discover Your Health Age - 2", "008", 3), 6);
+        assert.equal(licensesFor("Discover Your Health Age - 4", "008", 2), 8);
+    });
+
+    it("Small Venue Kit (SKU 004-1): 1 license × quantity", () => {
+        const name = "Health Expo Screening Kits - English / Small";
+        assert.equal(licensesFor(name, "004-1", 1), 1);
+        assert.equal(licensesFor(name, "004-1", 3), 3);
+        assert.equal(licensesFor(name, "004-1", 10), 10);
+    });
+
+    it("Large Venue Kit (SKU 004-2): 4 licenses × quantity", () => {
+        const name = "Health Expo Screening Kits - English / Large";
+        assert.equal(licensesFor(name, "004-2", 1), 4);
+        assert.equal(licensesFor(name, "004-2", 2), 8);
+        assert.equal(licensesFor(name, "004-2", 3), 12);
+    });
+
+    it("multiple Large Kits in one order: Large Venue Kit × 2 = 8 licenses for one customer", () => {
+        const plan = planFrom(order({ name: "#2100", email: "venue@example.com", id: "2100", lines: [largeKit(2)] }));
+        assert.equal(plan.customers.length, 1);
+        assert.equal(plan.customers[0]?.licenseQuantity, 8);
+        assert.equal(plan.customers[0]?.status, "ready_create_workspace");
+    });
+
+    it("multiple Large Kits across separate orders by the same purchaser combine into one customer", () => {
+        const plan = planFrom([
+            ...order({ name: "#2101", email: "Venue@Example.com", id: "2101", lines: [largeKit(1)] }),
+            ...order({ name: "#2102", email: "venue@example.com ", id: "2102", lines: [largeKit(1)] }),
+        ]);
+        assert.equal(plan.customers.length, 1);
+        assert.equal(plan.customers[0]?.email, "venue@example.com");
+        assert.equal(plan.customers[0]?.licenseQuantity, 8);
+        assert.equal(plan.customers[0]?.qualifyingOrderCount, 2);
+        assert.deepEqual(plan.customers[0]?.orderNumbers, ["#2101", "#2102"]);
+    });
+
+    it("mixed purchase: unrelated products in the same order add no licenses", () => {
+        const plan = planFrom(
+            order({
+                name: "#2103",
+                email: "mixed@example.com",
+                id: "2103",
+                lines: [
+                    unrelated("Hydrotherapy", "115"),
+                    largeKit(1),
+                    unrelated("Adult Health Banners - Premium (Indoor) / English"),
+                    unrelated("Mini-Wright Peak Flow Meter", "010"),
+                ],
+            })
+        );
+        assert.equal(plan.customers[0]?.licenseQuantity, 4);
+        assert.equal(plan.customers[0]?.status, "ready_create_workspace");
+        assert.equal(plan.skippedProducts.length, 3);
+    });
+
+    it("mixed purchase: software and kits in one order are summed", () => {
+        const plan = planFrom(
+            order({ name: "#2104", email: "both@example.com", id: "2104", lines: [dyha(2), smallKit(2), unrelated("Tip")] })
+        );
+        assert.equal(plan.customers[0]?.licenseQuantity, 2 + 2);
+        assert.deepEqual([...(plan.customers[0]?.families ?? [])].sort(), ["healthage_software", "venue_kit"]);
+    });
+
+    it("a quantity that cannot be read is ambiguous and never guessed", () => {
+        for (const quantity of [0, -1, 1.5, Number.NaN]) {
+            const kit = matchLineItem({ lineItemName: "Health Expo Screening Kits - English / Large", sku: "004-2", quantity });
+            assert.equal(kit.outcome, "ambiguous", `Large Kit x${quantity}`);
+        }
+        assert.equal(matchLineItem({ lineItemName: "Discover Your Health Age - 1", sku: "008", quantity: 0 }).outcome, "ambiguous");
+
+        const plan = planFrom(order({ name: "#2105", email: "qty@example.com", id: "2105", lines: [largeKit(0)] }));
+        assert.equal(plan.ambiguousRows.length, 1);
+        assert.equal(plan.customers[0]?.status, "blocked_ambiguous_data");
+        assert.equal(
+            resolveApplyAction({ customer: plan.customers[0]!, hasActiveWorkspace: false, hasLegacyMigrationWorkspace: false }),
+            "SKIP_MANUAL_REVIEW"
+        );
+    });
+});
+
+describe("SKU-first product identification", () => {
+    it("a known eligible SKU with a title that disagrees is ambiguous, not silently dropped or accepted", () => {
+        const match = matchLineItem({ lineItemName: "Health Expo Screening Kits - Spanish / Large", sku: "004-2", quantity: 1 });
+        assert.equal(match.outcome, "ambiguous");
+        if (match.outcome === "ambiguous") {
+            assert.equal(match.rule.id, "health_expo_screening_kit_large");
+            assert.match(match.reason, /004-2/);
+        }
+    });
+
+    it("an eligible-looking title carrying another eligible product's SKU is ambiguous (the SKU wins, the title is flagged)", () => {
+        const largeTitleSmallSku = matchLineItem({ lineItemName: "Health Expo Screening Kits - English / Large", sku: "004-1", quantity: 1 });
+        assert.equal(largeTitleSmallSku.outcome, "ambiguous");
+        if (largeTitleSmallSku.outcome === "ambiguous") {
+            assert.equal(largeTitleSmallSku.rule.id, "health_expo_screening_kit_small");
+            assert.match(largeTitleSmallSku.reason, /SKU "004-1" identifies .*Small Venue Kit.* does not match the expected title/);
+        }
+
+        assert.equal(matchLineItem({ lineItemName: "Discover Your Health Age - 2", sku: "004-2", quantity: 1 }).outcome, "ambiguous");
+        assert.equal(matchLineItem({ lineItemName: "Health Expo Screening Kits - English / Small", sku: "008", quantity: 1 }).outcome, "ambiguous");
+    });
+
+    it("an eligible-looking title carrying a SKU we do not know is ambiguous (catalogue drift)", () => {
+        const drifted = matchLineItem({ lineItemName: "Health Expo Screening Kits - English / Large", sku: "004-9", quantity: 1 });
+        assert.equal(drifted.outcome, "ambiguous");
+        if (drifted.outcome === "ambiguous") {
+            assert.equal(drifted.rule.id, "health_expo_screening_kit_large");
+            assert.match(drifted.reason, /SKU "004-9" does not match the expected SKU\(s\) 004-2/);
+        }
+        assert.equal(matchLineItem({ lineItemName: "Discover Your Health Age - 3", sku: "999", quantity: 1 }).outcome, "ambiguous");
+    });
+
+    it("the title decides only when the SKU is blank", () => {
+        const large = matchLineItem({ lineItemName: "Health Expo Screening Kits - English / Large", sku: "", quantity: 1 });
+        assert.equal(large.outcome, "eligible");
+        if (large.outcome === "eligible") assert.equal(large.licenses, 4);
+        const software = matchLineItem({ lineItemName: "Discover Your Health Age - 2", sku: "  ", quantity: 1 });
+        assert.equal(software.outcome, "eligible");
+        if (software.outcome === "eligible") assert.equal(software.licenses, 2);
+    });
+
+    it("an unrelated title with an unrelated SKU is skipped", () => {
+        assert.equal(matchLineItem({ lineItemName: "Charcoal", sku: "108", quantity: 1 }).outcome, "skipped");
+        assert.equal(matchLineItem({ lineItemName: "Health Expo Manual (Download) - English", sku: "003-1", quantity: 1 }).outcome, "skipped");
+    });
+
+    it("a SKU/title conflict blocks the whole order so nothing is created for it", () => {
+        const plan = planFrom(
+            order({
+                name: "#2200",
+                email: "conflict@example.com",
+                id: "2200",
+                lines: [{ "Lineitem name": "Health Expo Screening Kits - Spanish / Large", "Lineitem sku": "004-2" }],
+            })
+        );
+        assert.equal(plan.ambiguousRows.length, 1);
+        assert.equal(plan.customers[0]?.status, "blocked_ambiguous_data");
+        assert.equal(
+            resolveApplyAction({ customer: plan.customers[0]!, hasActiveWorkspace: false, hasLegacyMigrationWorkspace: false }),
+            "SKIP_MANUAL_REVIEW"
+        );
+    });
+});
+
+describe("purchaser grouping and organization creation", () => {
+    const comboPlan = () =>
+        planFrom([
+            ...order({ name: "#2301", email: "Boss@Venue.org", id: "2301", lines: [dyha(2)], billingName: "Pat Boss", company: "Venue Church" }),
+            ...order({ name: "#2302", email: " boss@venue.org ", id: "2302", lines: [smallKit(2)] }),
+            ...order({ name: "#2303", email: "BOSS@VENUE.ORG", id: "2303", lines: [largeKit(1), unrelated("Tip")] }),
+        ]);
+
+    it("one purchaser buying several eligible products becomes one customer with combined licenses", () => {
+        const plan = comboPlan();
+        assert.equal(plan.customers.length, 1);
+        const customer = plan.customers[0]!;
+        assert.equal(customer.email, "boss@venue.org");
+        assert.equal(customer.licenseQuantity, 2 + 2 + 4);
+        assert.equal(customer.qualifyingOrderCount, 3);
+        assert.deepEqual(customer.orderNumbers, ["#2301", "#2302", "#2303"]);
+        assert.deepEqual([...customer.families].sort(), ["healthage_software", "venue_kit"]);
+        assert.equal(customer.status, "ready_create_workspace");
+    });
+
+    it("creates exactly one organization with the combined seat count and one owner membership", async () => {
+        const db = createMemoryDb();
+        const { results } = await runApply({ db, plan: comboPlan(), runDate: new Date("2026-11-04T00:00:00.000Z"), writeMode: NO_EMAIL_MODE });
+        assert.equal(results[0]?.wrote, true);
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.workspaces[0]?.seat_limit, 8);
+        assert.equal(db.members.length, 1);
+        assert.equal(db.workspaces[0]?.name, "Venue Church");
+        assert.match(db.workspaces[0]?.notes ?? "", /#2301, #2302, #2303/);
+    });
+
+    it("the purchaser becomes the organization owner/admin, and Large Kit × 2 leaves 7 seats to assign", async () => {
+        const plan = planFrom(order({ name: "#2310", email: "Venue@Example.com", id: "2310", lines: [largeKit(2)] }));
+        const db = createMemoryDb();
+        await runApply({ db, plan, runDate: new Date("2026-11-04T00:00:00.000Z"), writeMode: NO_EMAIL_MODE });
+
+        const workspace = db.workspaces[0]!;
+        const member = db.members[0]!;
+        assert.equal(workspace.owner_email, "venue@example.com");
+        assert.equal(workspace.seat_limit, 8);
+        assert.equal(member.workspaceId, workspace.id);
+        assert.equal(member.email, workspace.owner_email);
+        assert.equal(member.role, GRANT_CONFIG.ownerRole);
+        assert.equal(member.role, "owner");
+
+        // The live seat rule counts the owner's membership as a seat, so 7 of the 8 remain.
+        assert.equal(hasAvailableWorkspaceSeat(db.members.length, workspace.seat_limit), true);
+        for (let assigned = 1; assigned < workspace.seat_limit; assigned++) {
+            assert.equal(hasAvailableWorkspaceSeat(assigned, workspace.seat_limit), true);
+        }
+        assert.equal(hasAvailableWorkspaceSeat(workspace.seat_limit, workspace.seat_limit), false);
+    });
+
+    it("a purchaser without an account is invited in the exact shape the login hook claims", async () => {
+        const plan = planFrom(order({ name: "#2311", email: "New.Buyer@Example.com", id: "2311", lines: [smallKit(1)] }));
+        const db = createMemoryDb();
+        await runApply({ db, plan, runDate: new Date("2026-11-04T00:00:00.000Z"), writeMode: NO_EMAIL_MODE });
+        const member = db.members[0]!;
+        // linkWorkspaceMembershipsForUser claims rows where email = user.email, user_id IS NULL, status = 'invited'.
+        assert.equal(member.status, "invited");
+        assert.equal(member.userId, null);
+        assert.equal(member.email, member.email.toLowerCase());
+        assert.equal(member.email, "new.buyer@example.com");
+    });
+
+    it("a purchaser who already has an account gets an active owner membership linked to it", async () => {
+        const plan = planFrom(order({ name: "#2312", email: "known@example.com", id: "2312", lines: [largeKit(1)] }));
+        const users = [{ id: "user-9", email: "known@example.com", name: "Known" }];
+        const db = createMemoryDb({ users });
+        await runApply({ db, plan, runDate: new Date("2026-11-04T00:00:00.000Z"), writeMode: NO_EMAIL_MODE, users });
+        assert.equal(db.members[0]?.status, "active");
+        assert.equal(db.members[0]?.userId, "user-9");
+        assert.equal(db.members[0]?.role, "owner");
+    });
+
+    it("each purchaser in a run gets their own organization with their own seat total", async () => {
+        const plan = planFrom([
+            ...order({ name: "#2320", email: "one@example.com", id: "2320", lines: [largeKit(2)] }),
+            ...order({ name: "#2321", email: "two@example.com", id: "2321", lines: [smallKit(1)] }),
+            ...order({ name: "#2322", email: "ONE@example.com", id: "2322", lines: [dyha(3)] }),
+        ]);
+        const db = createMemoryDb();
+        await runApply({ db, plan, runDate: new Date("2026-11-04T00:00:00.000Z"), writeMode: NO_EMAIL_MODE });
+        assert.equal(db.workspaces.length, 2);
+        assert.equal(db.members.length, 2);
+        const seats = Object.fromEntries(db.workspaces.map((workspace) => [workspace.owner_email, workspace.seat_limit]));
+        assert.deepEqual(seats, { "one@example.com": 8 + 3, "two@example.com": 1 });
+    });
+
+    it("per-product totals add up to the combined seat total", () => {
+        const plan = comboPlan();
+        const byProduct = summarizeLicensesByProduct(plan.customers);
+        const licenses = Object.fromEntries(byProduct.map((product) => [product.ruleId, product.licenses]));
+        assert.deepEqual(licenses, {
+            discover_your_health_age: 2,
+            health_expo_screening_kit_small: 2,
+            health_expo_screening_kit_large: 4,
+        });
+        assert.equal(
+            byProduct.reduce((total, product) => total + product.licenses, 0),
+            plan.customers[0]?.licenseQuantity
+        );
+        assert.ok(byProduct.every((product) => product.customers <= 1));
+    });
+});
+
+describe("refunds, cancellations, missing emails and manual review", () => {
+    const createdNothing = async (plan: ReturnType<typeof planFrom>) => {
+        const db = createMemoryDb();
+        const { results, decisions } = await runApply({
+            db,
+            plan,
+            runDate: new Date("2026-11-04T00:00:00.000Z"),
+            writeMode: APPLY_MODE,
+        });
+        assert.equal(db.workspaces.length, 0);
+        assert.equal(db.members.length, 0);
+        assert.equal(db.writes(), 0);
+        assert.ok(results.every((result) => !result.wrote && !result.emailed));
+        return decisions;
+    };
+
+    it("a fully refunded venue kit order is excluded and nothing is written", async () => {
+        const plan = planFrom(
+            order({ name: "#2400", email: "refunded@example.com", id: "2400", lines: [largeKit(1)], status: "refunded", refunded: "1100.00" })
+        );
+        assert.equal(plan.customers[0]?.status, "skip_no_qualifying_order");
+        assert.equal(plan.excludedOrders.length, 1);
+        const decisions = await createdNothing(plan);
+        assert.equal(decisions[0]?.action, "SKIP_REFUNDED");
+    });
+
+    it("a cancelled order is excluded even though its financial status is paid", async () => {
+        const plan = planFrom(
+            order({
+                name: "#2401",
+                email: "cancelled@example.com",
+                id: "2401",
+                lines: [smallKit(1)],
+                cancelledAt: "2026-06-02 10:00:00 -0700",
+            })
+        );
+        assert.equal(plan.customers[0]?.status, "skip_no_qualifying_order");
+        assert.match(plan.excludedOrders[0]?.reason ?? "", /cancelled/i);
+        const decisions = await createdNothing(plan);
+        assert.equal(decisions[0]?.action, "SKIP_REFUNDED");
+    });
+
+    it("missing or unusable emails are blocked, never merged with each other, and never written", async () => {
+        const plan = planFrom([
+            ...order({ name: "#2402", email: "", id: "2402", lines: [largeKit(1)], billingName: "No Email One" }),
+            ...order({ name: "#2403", email: "not-an-email", id: "2403", lines: [smallKit(1)], billingName: "No Email Two" }),
+            ...order({ name: "#2404", email: "", id: "2404", lines: [dyha(1)], billingName: "No Email Three" }),
+        ]);
+        assert.equal(plan.customers.length, 3);
+        assert.ok(plan.customers.every((customer) => customer.status === "blocked_missing_email" && customer.email === ""));
+        const decisions = await createdNothing(plan);
+        assert.ok(decisions.every((decision) => decision.action === "SKIP_MISSING_EMAIL"));
+    });
+
+    it("order #1425 shape (partially refunded kit + software + other products) is held for manual review", async () => {
+        const plan = planFrom(
+            order({
+                name: "#1425",
+                email: "munthaliw101@gmail.com",
+                id: "1425",
+                status: "partially_refunded",
+                refunded: "292.50",
+                lines: [
+                    smallKit(1),
+                    unrelated("Omron Body Fat Monitor", "016"),
+                    unrelated("Adult Health Expo Booklets - English / 100"),
+                    dyha(1),
+                    unrelated("Adult Health Banners - Premium (Indoor) / English"),
+                    unrelated("Health Expo Manual (Download) - English", "003-1"),
+                ],
+            })
+        );
+        assert.equal(plan.customers[0]?.status, "manual_review_partial_refund");
+        assert.match(plan.customers[0]?.reviewNotes.join(" ") ?? "", /refund allocation/);
+        const decisions = await createdNothing(plan);
+        assert.equal(decisions[0]?.action, "SKIP_MANUAL_REVIEW");
+    });
+
+    it("a paid order that still carries a Refunded Amount is treated as partially refunded", async () => {
+        assert.equal(isPartiallyRefunded({ financialStatus: "paid", refundedAmount: 0 }), false);
+        assert.equal(isPartiallyRefunded({ financialStatus: "paid", refundedAmount: 25 }), true);
+        assert.equal(isPartiallyRefunded({ financialStatus: "partially_refunded", refundedAmount: 0 }), true);
+
+        const plan = planFrom(
+            order({ name: "#2410", email: "stale@example.com", id: "2410", lines: [largeKit(1)], status: "paid", refunded: "25.00" })
+        );
+        assert.equal(plan.customers[0]?.status, "manual_review_partial_refund");
+        const decisions = await createdNothing(plan);
+        assert.equal(decisions[0]?.action, "SKIP_MANUAL_REVIEW");
+    });
+
+    it("a clean order does not rescue a purchaser who also has a partially refunded order", async () => {
+        const plan = planFrom([
+            ...order({ name: "#2420", email: "split@example.com", id: "2420", lines: [largeKit(1)] }),
+            ...order({ name: "#2421", email: "split@example.com", id: "2421", lines: [dyha(1)], status: "partially_refunded", refunded: "10.00" }),
+        ]);
+        assert.equal(plan.customers.length, 1);
+        assert.equal(plan.customers[0]?.status, "manual_review_partial_refund");
+        const decisions = await createdNothing(plan);
+        assert.equal(decisions[0]?.action, "SKIP_MANUAL_REVIEW");
+    });
+
+    it("a purchaser with one clean order and one fully refunded order is migrated for the clean order only", () => {
+        const plan = planFrom([
+            ...order({ name: "#2430", email: "partly@example.com", id: "2430", lines: [largeKit(1)] }),
+            ...order({ name: "#2431", email: "partly@example.com", id: "2431", lines: [largeKit(1)], status: "refunded", refunded: "1100.00" }),
+        ]);
+        assert.equal(plan.customers.length, 1);
+        assert.equal(plan.customers[0]?.status, "ready_create_workspace");
+        assert.equal(plan.customers[0]?.licenseQuantity, 4);
+        assert.deepEqual(plan.customers[0]?.orderNumbers, ["#2430"]);
+    });
+});
+
+describe("idempotency and transaction safety", () => {
+    const comboPlan = () =>
+        planFrom([
+            ...order({ name: "#2501", email: "boss@venue.org", id: "2501", lines: [dyha(2)] }),
+            ...order({ name: "#2502", email: "boss@venue.org", id: "2502", lines: [largeKit(1)] }),
+        ]);
+    const runDate = new Date("2026-11-04T09:00:00.000Z");
+
+    it("a duplicate run creates no second workspace or membership and does not double the seats", async () => {
+        const db = createMemoryDb();
+        const plan = comboPlan();
+
+        const first = await runApply({ db, plan, runDate, writeMode: APPLY_MODE });
+        assert.equal(first.decisions[0]?.action, "CREATE");
+        assert.equal(first.results[0]?.wrote, true);
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.members.length, 1);
+        assert.equal(db.workspaces[0]?.seat_limit, 6);
+        assert.deepEqual(first.emails, ["boss@venue.org"]);
+
+        const second = await runApply({ db, plan, runDate, writeMode: APPLY_MODE });
+        assert.equal(second.decisions[0]?.action, "SKIP_EXISTING");
+        assert.equal(second.results[0]?.wrote, false);
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.members.length, 1);
+        assert.equal(db.workspaces[0]?.seat_limit, 6);
+        assert.deepEqual(second.emails, []);
+    });
+
+    it("a second run still skips even if the first decision snapshot was stale (checked again inside the transaction)", async () => {
+        const db = createMemoryDb();
+        const plan = comboPlan();
+        const staleDecision = applyCreateLimit(
+            [decideCustomer({ customer: plan.customers[0]!, runDate, user: undefined, workspaces: [], dbChecked: true })],
+            null
+        )[0]!;
+
+        await runApply({ db, plan, runDate, writeMode: NO_EMAIL_MODE });
+        assert.equal(db.workspaces.length, 1);
+
+        const stale = await applyOneCustomer({
+            runner: db.runner,
+            notesWriter: db.executor,
+            customer: plan.customers[0]!,
+            decision: staleDecision,
+            writeMode: NO_EMAIL_MODE,
+            emailConfig: TEST_EMAIL_CONFIG,
+            sendEmail: async () => {
+                throw new Error("must not send");
+            },
+            now: runDate,
+        });
+        assert.equal(stale.wrote, false);
+        assert.equal(stale.action, "SKIP_EXISTING");
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.members.length, 1);
+    });
+
+    it("if the owner membership insert fails, the workspace is rolled back; a retry creates exactly one of each", async () => {
+        const db = createMemoryDb();
+        const plan = comboPlan();
+        const original = db.executor.insertOwnerMembership;
+        db.executor.insertOwnerMembership = async () => {
+            throw new Error("membership insert failed");
+        };
+
+        const failed = await runApply({ db, plan, runDate, writeMode: APPLY_MODE });
+        assert.equal(failed.results[0]?.error, "membership insert failed");
+        assert.equal(failed.results[0]?.wrote, false);
+        assert.equal(db.workspaces.length, 0, "no orphan workspace without its owner");
+        assert.equal(db.members.length, 0);
+        assert.deepEqual(failed.emails, []);
+
+        db.executor.insertOwnerMembership = original;
+        const retried = await runApply({ db, plan, runDate, writeMode: APPLY_MODE });
+        assert.equal(retried.results[0]?.wrote, true);
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.members.length, 1);
+    });
+
+    it("an existing legacy workspace is reused as-is; a seat difference is surfaced, not silently edited", async () => {
+        const existing: ExistingWorkspace = {
+            id: "legacy-1",
+            name: "Boss",
+            owner_email: "boss@venue.org",
+            status: "active",
+            subscription_status: "active",
+            plan: "organization",
+            seat_limit: 2,
+            expires_at: new Date("2099-01-01T00:00:00.000Z"),
+            billing_source: GRANT_CONFIG.workspaceBillingSource,
+            notes: "Legacy Shopify migration — order(s) #2501",
+        };
+        const db = createMemoryDb({ workspaces: [existing] });
+        const { decisions, results } = await runApply({ db, plan: comboPlan(), runDate, writeMode: APPLY_MODE });
+        assert.equal(decisions[0]?.action, "SKIP_EXISTING");
+        assert.match(decisions[0]?.reviewNotes.join(" ") ?? "", /has 2 seat\(s\) but the plan totals 6/);
+        assert.equal(results[0]?.wrote, false);
+        assert.equal(db.writes(), 0);
+        assert.equal(db.workspaces.length, 1);
+        assert.equal(db.workspaces[0]?.seat_limit, 2);
+    });
+
+    it("an active Shopify-managed workspace for the purchaser is never touched", async () => {
+        const live: ExistingWorkspace = {
+            id: "live-1",
+            name: "Live org",
+            owner_email: "boss@venue.org",
+            status: "active",
+            subscription_status: "active",
+            plan: "organization",
+            seat_limit: 10,
+            expires_at: new Date("2099-01-01T00:00:00.000Z"),
+            billing_source: "shopify",
+            notes: null,
+        };
+        const db = createMemoryDb({ workspaces: [live] });
+        const { decisions, emails } = await runApply({ db, plan: comboPlan(), runDate, writeMode: APPLY_MODE });
+        assert.equal(decisions[0]?.action, "SKIP_EXISTING");
+        assert.equal(db.writes(), 0);
+        assert.equal(db.workspaces[0]?.seat_limit, 10);
+        assert.deepEqual(emails, []);
+    });
+});
+
+describe("one-year free access window", () => {
+    it("expiry is exactly run date + 365 days for venue kit customers, whenever they bought", async () => {
+        // 2027-03-01 + 365 days crosses 29 Feb 2028, so this fails if "1 year" were used instead of 365 days.
+        const runDate = new Date("2027-03-01T10:00:00.000Z");
+        const plan = planFrom([
+            ...order({ name: "#2600", email: "early@example.com", id: "2600", lines: [smallKit(1)] }),
+            {
+                ...order({ name: "#2601", email: "late@example.com", id: "2601", lines: [largeKit(1)] })[0]!,
+                "Created at": "2026-07-22 16:22:04 -0700",
+            },
+        ]);
+        const db = createMemoryDb();
+        const { decisions } = await runApply({ db, plan, runDate, writeMode: NO_EMAIL_MODE });
+
+        assert.equal(db.workspaces.length, 2);
+        for (const workspace of db.workspaces) {
+            assert.equal(workspace.expires_at?.toISOString(), "2028-02-29T10:00:00.000Z");
+            assert.equal(workspace.expires_at!.getTime() - runDate.getTime(), 365 * 24 * 60 * 60 * 1000);
+        }
+        for (const decision of decisions) {
+            assert.equal(decision.startDate, "2027-03-01");
+            assert.equal(decision.expiryDate, "2028-02-29");
+        }
+    });
+
+    it("the grant starts on the migration run date, not the purchase date", () => {
+        assert.equal(GRANT_CONFIG.grantStartsFrom, "migration_run_date");
+        assert.equal(GRANT_CONFIG.accessDurationDays, 365);
+        assert.equal(GRANT_CONFIG.workspaceBillingSource, "legacy_shopify_migration");
+
+        const plan = planFrom(order({ name: "#2610", email: "old@example.com", id: "2610", lines: [largeKit(1)] }));
+        const runDate = new Date("2026-11-04T08:30:00.000Z");
+        const customer = { ...plan.customers[0]!, lastPurchaseDate: "2026-03-20" };
+        assert.equal(formatGrantDisplayDate(resolveGrantExpiry(customer, runDate)), "2027-11-04");
+    });
+});
+
+describe("email safety", () => {
+    const runDate = new Date("2026-11-04T09:00:00.000Z");
+    const kitPlan = () =>
+        planFrom([
+            ...order({ name: "#2700", email: "kit.one@example.com", id: "2700", lines: [largeKit(2)] }),
+            ...order({ name: "#2701", email: "kit.two@example.com", id: "2701", lines: [smallKit(1), dyha(1)] }),
+        ]);
+
+    it("--dry-run sends no email and writes nothing, even when --apply is also passed", async () => {
+        const mode = resolveWriteMode(parseApplyArgs(["--apply", "--dry-run"]));
+        assert.deepEqual(mode, { writesEnabled: false, emailsEnabled: false });
+
+        const db = createMemoryDb();
+        const { results, emails } = await runApply({ db, plan: kitPlan(), runDate, writeMode: mode });
+        assert.deepEqual(emails, []);
+        assert.equal(db.writes(), 0);
+        assert.equal(db.workspaces.length, 0);
+        assert.ok(results.every((result) => !result.wrote && !result.emailed));
+    });
+
+    it("without --apply nothing is written or emailed", async () => {
+        const mode = resolveWriteMode(parseApplyArgs(["--no-email"]));
+        assert.deepEqual(mode, { writesEnabled: false, emailsEnabled: false });
+        const db = createMemoryDb();
+        const { emails } = await runApply({ db, plan: kitPlan(), runDate, writeMode: mode });
+        assert.deepEqual(emails, []);
+        assert.equal(db.writes(), 0);
+    });
+
+    it("--apply --no-email creates the organizations but never calls the email sender", async () => {
+        const mode = resolveWriteMode(parseApplyArgs(["--apply", "--no-email"]));
+        assert.deepEqual(mode, { writesEnabled: true, emailsEnabled: false });
+
+        const db = createMemoryDb();
+        const { results, emails } = await runApply({ db, plan: kitPlan(), runDate, writeMode: mode });
+        assert.equal(db.workspaces.length, 2);
+        assert.equal(db.members.length, 2);
+        assert.deepEqual(emails, []);
+        assert.ok(results.every((result) => result.wrote && !result.emailed && result.emailError === null));
+        assert.ok(db.workspaces.every((workspace) => !notesIndicateFreeYearEmailSent(workspace.notes)));
+    });
+
+    it("--apply without --no-email keeps the existing behaviour: one email per created organization, after commit", async () => {
+        const mode = resolveWriteMode(parseApplyArgs(["--apply"]));
+        assert.deepEqual(mode, { writesEnabled: true, emailsEnabled: true });
+
+        const db = createMemoryDb();
+        const { emails } = await runApply({ db, plan: kitPlan(), runDate, writeMode: mode });
+        assert.deepEqual([...emails].sort(), ["kit.one@example.com", "kit.two@example.com"]);
+        assert.ok(db.workspaces.every((workspace) => notesIndicateFreeYearEmailSent(workspace.notes)));
+    });
+
+    it("a mistyped safety flag is rejected instead of silently being ignored", () => {
+        assert.throws(() => parseApplyArgs(["--apply", "--no-emial"]), /Unknown argument: --no-emial/);
+        assert.throws(() => parseApplyArgs(["--dryrun"]), /Unknown argument/);
+        assert.throws(() => parseApplyArgs(["--limit=0"]), /Invalid --limit/);
+    });
+
+    it("the pnpm '--' separator and every documented flag are still accepted", () => {
+        const args = parseApplyArgs(["--", "--dry-run", "--skip-db", "--csv=x.csv", "--out=reports", "--limit=3", "--no-email"]);
+        assert.deepEqual(args, {
+            csvPath: "x.csv",
+            outDir: "reports",
+            skipDb: true,
+            apply: false,
+            dryRun: true,
+            noEmail: true,
+            limit: 3,
+            onlyEmails: [],
+        });
+    });
+
+    it("the approved free-year template is unchanged and not product-specific", () => {
+        const content = getLegacyFreeYearEmailContent({
+            customerName: "Pat",
+            startDate: "2026-11-04",
+            expiryDate: "2027-11-04",
+            androidUrl: PLAY_STORE_URL,
+            windowsUrl: MICROSOFT_STORE_URL,
+            supportEmail: SUPPORT_EMAIL,
+        });
+        assert.equal(content.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
+        assert.match(content.text, /Start Date: 2026-11-04\nExpires: 2027-11-04/);
+        assert.match(content.text, /- Pastor Rodney Bowes$/);
+        assert.doesNotMatch(content.text, /\biOS:|\bmacOS:/);
+    });
+});
+
+describe("real export (orders_export_1.csv) with venue kits included", () => {
+    const load = () => {
+        const plan = buildMigrationPlan(readOrdersCsv(resolve(process.cwd(), "orders_export_1.csv")));
+        const decisions = applyCreateLimit(
+            plan.customers.map((customer) =>
+                decideCustomer({ customer, runDate: new Date("2026-11-04T00:00:00.000Z"), user: undefined, workspaces: [], dbChecked: false })
+            ),
+            null
+        );
+        const byOrder = (orderNumber: string) => {
+            const decision = decisions.find((candidate) => candidate.customer.orderNumbers.includes(orderNumber));
+            assert.ok(decision, `${orderNumber} should belong to a planned customer`);
+            return decision;
+        };
+        return { plan, decisions, byOrder };
+    };
+
+    it("order #1425 (partially refunded, mixed) is held for manual review and not created", () => {
+        const { byOrder } = load();
+        const decision = byOrder("#1425");
+        assert.equal(decision.customer.status, "manual_review_partial_refund");
+        assert.equal(decision.action, "SKIP_MANUAL_REVIEW");
+        assert.equal(decision.inThisRun, false);
+    });
+
+    it("paid kit orders are created at 4 licenses per Large Kit and 1 per Small Kit", () => {
+        const { byOrder } = load();
+        for (const orderNumber of ["#1436", "#1435", "#1423", "#1389", "#1386"]) {
+            assert.equal(byOrder(orderNumber).action, "CREATE", orderNumber);
+            assert.equal(byOrder(orderNumber).customer.licenseQuantity, 4, orderNumber);
+        }
+        for (const orderNumber of ["#1426", "#1380"]) {
+            assert.equal(byOrder(orderNumber).action, "CREATE", orderNumber);
+            assert.equal(byOrder(orderNumber).customer.licenseQuantity, 1, orderNumber);
+        }
+    });
+
+    it("fully refunded orders and missing-email orders stay excluded", () => {
+        const { byOrder } = load();
+        assert.equal(byOrder("#1417").action, "SKIP_REFUNDED");
+        assert.equal(byOrder("#1418").action, "SKIP_REFUNDED");
+        assert.equal(byOrder("#1385").action, "SKIP_MISSING_EMAIL");
+        assert.equal(byOrder("#1394").action, "SKIP_MISSING_EMAIL");
+    });
+
+    it("per-product totals reconcile with the seats that would be written; one organization per email", () => {
+        const { decisions } = load();
+        const created = decisions.filter((decision) => decision.action === "CREATE").map((decision) => decision.customer);
+        const byProduct = summarizeLicensesByProduct(created);
+        const seats = created.reduce((total, customer) => total + customer.licenseQuantity, 0);
+        assert.equal(
+            byProduct.reduce((total, product) => total + product.licenses, 0),
+            seats
+        );
+
+        const large = byProduct.find((product) => product.ruleId === "health_expo_screening_kit_large")!;
+        const small = byProduct.find((product) => product.ruleId === "health_expo_screening_kit_small")!;
+        assert.equal(large.licenses, large.units * 4);
+        assert.equal(small.licenses, small.units * 1);
+
+        const emails = created.map((customer) => customer.email);
+        assert.equal(new Set(emails).size, emails.length);
+        assert.ok(emails.every((email) => email === email.trim().toLowerCase() && email.length > 0));
     });
 });
