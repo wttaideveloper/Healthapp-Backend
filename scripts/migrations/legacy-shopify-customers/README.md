@@ -181,6 +181,8 @@ sending without them is approved, add `--allow-missing-platform-links`.
 | `--test-recipients=a@x.com,b@y.com` | Test mode: messages go **only** to these addresses; customers are never contacted; ledger untouched. Default scope is 1 customer. |
 | `--send` | Live mode: email the customers and record each success. Needs `--limit=N`, `--all` or `--only-emails=…`. Cannot be combined with `--test-recipients`. |
 | `--only-emails=a@x.com,b@y.com` | **Exact-recipient pilot.** With `--send`, emails exactly these customers and nobody else; without `--send`, previews exactly that list. Cannot be combined with `--all`, `--limit` or `--test-recipients`. Every address must be emailable or already emailed, otherwise the whole run is refused before anything is sent. See "Pilot". |
+| `--sample` | **Sample email** with synthetic data to your own test inboxes. Preview unless `--send-sample`. Needs `--test-recipients`; never touches the database or the CSV. See "Sample email". |
+| `--send-sample` | With `--sample`, actually deliver the sample to the `--test-recipients` addresses (and only those). Refused without `--sample`. |
 | `--limit=N` | Process at most N customers, in email order. Successful sends drop out of the pending list, so repeated `--limit=N` runs walk through everyone. |
 | `--all` | Every pending customer (live mode only). |
 | `--allow-missing-platform-links` | Allow a live send without the iOS/macOS links. |
@@ -237,6 +239,45 @@ Start date is the workspace expiry minus 365 days, i.e. the stage 1 run date.
 
 Reports are written to `migration-reports/` (git-ignored; they contain customer
 addresses).
+
+## Sample email (synthetic, test inboxes only)
+
+`--sample` shows, and with `--send-sample` delivers, the real migration email
+filled with **made-up data** to inboxes you name. It involves no customers.
+
+```powershell
+# Preview (the default): prints the email and sends nothing.
+pnpm migrate:legacy-shopify:send-emails --sample "--test-recipients=you@yourdomain.com,colleague@yourdomain.com"
+
+# Deliver it to exactly those addresses:
+pnpm migrate:legacy-shopify:send-emails --sample --send-sample "--test-recipients=you@yourdomain.com,colleague@yourdomain.com"
+```
+
+What the email contains: the approved subject and body, unchanged, addressed to
+`HealthAge Test Customer` with the dates `2026-01-01 (sample date)` and
+`2027-01-01 (sample date)`, the configured support address, and all four
+platform links. The message carries the header
+`X-HealthAge-Migration-Email-Mode: sample`; the subject and body are untouched.
+
+Safety rules (all enforced in code and covered by tests, including a test that
+runs the real CLI against a fake mail server and a fake database):
+
+- `--sample` needs `--test-recipients`; `--send-sample` needs `--sample`.
+- `--send`, `--all`, `--limit`, `--only-emails`, `--csv`, `--out` and
+  `--allow-missing-platform-links` are **rejected**, not ignored. `--dry-run`
+  still wins over `--send-sample`.
+- It never connects to PostgreSQL, never reads the Shopify CSV, never writes a
+  report file, never creates or updates a workspace and never writes the email
+  ledger. Sample mode is decided in `main()` before any of those is touched.
+- The sender refuses every address that is not on the `--test-recipients` list.
+- A sample **send** is refused unless all four links and the support address are
+  configured (`HEALTHAGE_ANDROID_URL`, `HEALTHAGE_WINDOWS_URL`,
+  `HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`). There is no override: a sample
+  missing a link would test the wrong email. The preview shows which are set.
+
+Because sample mode does not read the database or the export, it **cannot check
+whether a recipient is a real customer** (plain `--test-recipients` without
+`--sample` can). Only list inboxes you own.
 
 ## Pilot: exactly the customers you name
 

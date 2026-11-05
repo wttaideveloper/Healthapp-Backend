@@ -22,6 +22,9 @@
  *   6. `--only-emails` makes the listed addresses the whole scope: nobody else can be
  *      selected, locked or sent to, and an address that cannot be emailed refuses the
  *      entire run before anything leaves.
+ *   7. `--sample` is a separate mode with its own runner (`runSampleStage`): synthetic
+ *      data, explicit test addresses, preview unless `--send-sample`. Nothing in it takes
+ *      a customer, a database or a ledger, and `runEmailStage` refuses it outright.
  */
 
 import {
@@ -34,7 +37,7 @@ import {
 } from "./apply-core";
 import { formatGrantDisplayDate, isUsableEmail, normalizeEmail } from "./build-plan";
 import type { FreeYearEmailRequest } from "./email-transport";
-import { inferMigrationCustomerDisplayName } from "./migration-email";
+import { getLegacyFreeYearEmailContent, inferMigrationCustomerDisplayName, type FreeYearEmailContent } from "./migration-email";
 import { GRANT_CONFIG } from "./product-eligibility";
 
 /** Header added to test messages. The subject and body stay exactly as approved. */
@@ -59,10 +62,17 @@ export type SendEmailsArgs = {
     /** Exact customer allowlist for a live pilot (normalized, de-duplicated). Empty = not supplied. */
     readonly onlyEmails: readonly string[];
     readonly allowMissingPlatformLinks: boolean;
+    /** Synthetic sample-email mode: no database, no CSV, no customers. Preview unless `sendSample`. */
+    readonly sample: boolean;
+    /** Actually deliver the sample email (to `testRecipients` only). Needs `sample`. */
+    readonly sendSample: boolean;
+    /** Whether `--csv=` / `--out=` were given explicitly (sample mode must reject them, not ignore them). */
+    readonly csvExplicit: boolean;
+    readonly outExplicit: boolean;
 };
 
 const SUPPORTED_FLAGS =
-    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --allow-missing-platform-links, --csv=, --out=";
+    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --sample, --send-sample, --allow-missing-platform-links, --csv=, --out=";
 
 /**
  * Unrecognised arguments are rejected, never ignored. In particular the stage 1
@@ -79,6 +89,10 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
     let testRecipients: string[] | null = null;
     let onlyEmails: string[] | null = null;
     let allowMissingPlatformLinks = false;
+    let sample = false;
+    let sendSample = false;
+    let csvExplicit = false;
+    let outExplicit = false;
 
     for (const argument of argv) {
         // pnpm forwards a literal "--" separator to the script; it carries no meaning.
@@ -86,10 +100,16 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
         if (argument === "--dry-run") dryRun = true;
         else if (argument === "--send") send = true;
         else if (argument === "--all") all = true;
+        else if (argument === "--sample") sample = true;
+        else if (argument === "--send-sample") sendSample = true;
         else if (argument === "--allow-missing-platform-links") allowMissingPlatformLinks = true;
-        else if (argument.startsWith("--csv=")) csvPath = argument.slice("--csv=".length);
-        else if (argument.startsWith("--out=")) outDir = argument.slice("--out=".length);
-        else if (argument.startsWith("--limit=")) {
+        else if (argument.startsWith("--csv=")) {
+            csvPath = argument.slice("--csv=".length);
+            csvExplicit = true;
+        } else if (argument.startsWith("--out=")) {
+            outDir = argument.slice("--out=".length);
+            outExplicit = true;
+        } else if (argument.startsWith("--limit=")) {
             const parsed = Number(argument.slice("--limit=".length));
             if (!Number.isInteger(parsed) || parsed <= 0) {
                 throw new Error(`Invalid --limit value: ${argument}`);
@@ -116,6 +136,10 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
         testRecipients: testRecipients ?? [],
         onlyEmails: onlyEmails ?? [],
         allowMissingPlatformLinks,
+        sample,
+        sendSample,
+        csvExplicit,
+        outExplicit,
     };
 }
 
@@ -135,8 +159,12 @@ function parseTestRecipients(value: string): string[] {
 }
 
 export type SendMode = {
-    /** Who a message goes to: the customers ("live") or only the allowlist ("test"). */
-    readonly target: "live" | "test";
+    /**
+     * Who a message goes to: the customers ("live"), only the allowlist with a real customer's
+     * rendering ("test"), or only the allowlist with synthetic data ("sample", which never
+     * touches the database or the export).
+     */
+    readonly target: "live" | "test" | "sample";
     /** False = preview: nothing leaves the process and nothing is written. */
     readonly sends: boolean;
     readonly testRecipients: readonly string[];
@@ -152,10 +180,13 @@ export type SendMode = {
 
 /**
  * Turns flags into a mode, rejecting every combination that is ambiguous or
- * unsafe. Nothing sends unless `--send` (live) or `--test-recipients` (test) was
- * given and `--dry-run` was not.
+ * unsafe. Nothing sends unless `--send` (live), `--test-recipients` (test) or
+ * `--send-sample` (sample) was given and `--dry-run` was not.
  */
 export function resolveSendMode(args: SendEmailsArgs): SendMode {
+    // Sample mode is decided first and on its own: it never shares a code path with live sending.
+    if (args.sample || args.sendSample) return resolveSampleMode(args);
+
     const isTest = args.testRecipients.length > 0;
     const isTargeted = args.onlyEmails.length > 0;
 
@@ -210,6 +241,44 @@ export function resolveSendMode(args: SendEmailsArgs): SendMode {
         onlyEmails: args.onlyEmails,
         limit: args.all ? null : args.limit,
         allowMissingPlatformLinks: args.allowMissingPlatformLinks,
+    };
+}
+
+/**
+ * `--sample`: a synthetic email to explicitly named test addresses. Anything that belongs to
+ * real-customer sending, or that would read the export or the database, is a conflict and an
+ * error, never something to ignore: a sample run must not be able to turn into a customer run.
+ */
+function resolveSampleMode(args: SendEmailsArgs): SendMode {
+    if (args.sendSample && !args.sample) {
+        throw new Error("--send-sample requires --sample: it only ever delivers the synthetic sample email.");
+    }
+
+    const conflicts: string[] = [];
+    if (args.send) conflicts.push("--send");
+    if (args.all) conflicts.push("--all");
+    if (args.limit !== null) conflicts.push("--limit");
+    if (args.onlyEmails.length > 0) conflicts.push("--only-emails");
+    if (args.csvExplicit) conflicts.push("--csv");
+    if (args.outExplicit) conflicts.push("--out");
+    if (args.allowMissingPlatformLinks) conflicts.push("--allow-missing-platform-links");
+    if (conflicts.length > 0) {
+        throw new Error(
+            `--sample cannot be combined with ${conflicts.join(", ")}: sample mode uses synthetic data only, never reads the Shopify CSV or the database, writes nothing, and never contacts customers. To deliver the sample use --send-sample.`
+        );
+    }
+
+    if (args.testRecipients.length === 0) {
+        throw new Error("--sample needs --test-recipients=a@x.com,b@y.com: a sample email goes only to the addresses you name.");
+    }
+
+    return {
+        target: "sample",
+        sends: args.sendSample && !args.dryRun,
+        testRecipients: args.testRecipients,
+        onlyEmails: [],
+        limit: null,
+        allowMissingPlatformLinks: false,
     };
 }
 
@@ -484,6 +553,7 @@ export type EmailSender = (
  * wrong:
  *   - preview: refuses everything
  *   - test:    refuses any address not on the allowlist, and marks the message
+ *   - sample:  exactly like test (same allowlist), but the marker says "sample"
  *   - live:    refuses any address that is not one of this run's selected customers
  */
 export function createGuardedSender(input: {
@@ -501,11 +571,11 @@ export function createGuardedSender(input: {
         if (!input.mode.sends) {
             throw new Error("Refusing to send: this run is a preview.");
         }
-        if (input.mode.target === "test") {
+        if (input.mode.target === "test" || input.mode.target === "sample") {
             if (!testAllowlist.has(to)) {
                 throw new Error(`Refusing to send to ${to}: not on the test recipient allowlist.`);
             }
-            return input.rawSender(request, { headers: { ...options?.headers, [TEST_MODE_HEADER]: "test" } });
+            return input.rawSender(request, { headers: { ...options?.headers, [TEST_MODE_HEADER]: input.mode.target } });
         }
         if (input.mode.onlyEmails.length > 0 && !onlyAllowlist.has(to)) {
             throw new Error(`Refusing to send to ${to}: not on the --only-emails allowlist.`);
@@ -596,6 +666,12 @@ export async function runEmailStage(input: {
 }): Promise<EmailOutcome[]> {
     const { mode } = input;
     const now = input.now ?? (() => new Date());
+
+    // Sample mode has its own runner (`runSampleStage`) that takes no customers and no ledger. If it
+    // ever reached this one it would fall through to the LIVE path, so it is refused outright.
+    if (mode.target === "sample") {
+        throw new Error("runEmailStage does not handle sample mode; use runSampleStage (synthetic data, no customers, no ledger).");
+    }
 
     // An exact-recipient run must never be handed anyone else. Checked before anything is
     // sent or locked, so a mis-wired caller fails closed.
@@ -745,4 +821,107 @@ export function emailRunExitCode(outcomes: readonly EmailOutcome[]): 0 | 1 {
 export function countNotAttempted(selected: readonly EmailCandidate[], outcomes: readonly EmailOutcome[]): number {
     const handled = new Set(outcomes.map((outcome) => outcome.workspaceId));
     return selected.filter((candidate) => !handled.has(candidate.workspace.id)).length;
+}
+
+// ---------------------------------------------------------------------------
+// Sample email: synthetic data, explicit test addresses, nothing else
+// ---------------------------------------------------------------------------
+//
+// Everything below is deliberately free of customers, the database, the export and the
+// ledger: no function here takes any of them as a parameter, so a sample run has no way
+// to read or write one. The message is rendered by the same approved template as a real
+// one; only the values filled into it are synthetic.
+
+/** The customer every sample email is addressed to. Obviously not a real person. */
+export const SAMPLE_CUSTOMER_NAME = "HealthAge Test Customer";
+
+/** Labelled so a sample can never be mistaken for a real grant. 365 days apart, like a real one. */
+export const SAMPLE_START_DATE = "2026-01-01 (sample date)";
+export const SAMPLE_EXPIRY_DATE = "2027-01-01 (sample date)";
+
+/**
+ * A sample exists to show the real email with all four platform links, so it is refused
+ * unless every one of them (and the support address) is configured. Unlike a live send
+ * there is no override: a sample missing a link would test the wrong email.
+ */
+export function sampleSendBlockers(config: EmailConfig): string[] {
+    const blockers = [...emailConfigIssues(config)];
+    if (!config.androidUrl) blockers.push("HEALTHAGE_ANDROID_URL is not set");
+    if (!config.windowsUrl) blockers.push("HEALTHAGE_WINDOWS_URL is not set");
+    if (!config.iosUrl) blockers.push("HEALTHAGE_IOS_URL is not set");
+    if (!config.macosUrl) blockers.push("HEALTHAGE_MACOS_URL is not set");
+    return blockers;
+}
+
+export function buildSampleRequest(to: string, config: EmailConfig): FreeYearEmailRequest {
+    return {
+        to,
+        customerName: SAMPLE_CUSTOMER_NAME,
+        startDate: SAMPLE_START_DATE,
+        expiryDate: SAMPLE_EXPIRY_DATE,
+        androidUrl: config.androidUrl,
+        windowsUrl: config.windowsUrl,
+        iosUrl: config.iosUrl,
+        macosUrl: config.macosUrl,
+        supportEmail: config.supportEmail ?? "(HEALTHAGE_SUPPORT_EMAIL is not set)",
+    };
+}
+
+/** The approved subject and body with the sample values, for the preview. Same template as a real send. */
+export function renderSampleEmail(config: EmailConfig): FreeYearEmailContent {
+    const request = buildSampleRequest("preview@sample.invalid", config);
+    return getLegacyFreeYearEmailContent({
+        customerName: request.customerName,
+        startDate: request.startDate,
+        expiryDate: request.expiryDate,
+        androidUrl: request.androidUrl,
+        windowsUrl: request.windowsUrl,
+        iosUrl: request.iosUrl,
+        macosUrl: request.macosUrl,
+        supportEmail: request.supportEmail,
+    });
+}
+
+export type SampleOutcome = {
+    readonly to: string;
+    readonly status: "previewed" | "sent" | "failed";
+    readonly error: string | null;
+};
+
+/**
+ * Previews, or sends, the sample email to the mode's explicit test addresses, one message each.
+ * `sender` must be the guarded sender, which refuses every address that is not on the allowlist
+ * and refuses everything in a preview. One failed address does not stop the others.
+ */
+export async function runSampleStage(input: {
+    mode: SendMode;
+    emailConfig: EmailConfig;
+    sender: EmailSender;
+}): Promise<SampleOutcome[]> {
+    const { mode } = input;
+    if (mode.target !== "sample") {
+        throw new Error("runSampleStage only runs in sample mode.");
+    }
+    if (mode.testRecipients.length === 0) {
+        throw new Error("A sample run needs at least one explicit test recipient.");
+    }
+    if (mode.sends) {
+        const blockers = sampleSendBlockers(input.emailConfig);
+        if (blockers.length > 0) throw new Error(`Sample send refused: ${blockers.join("; ")}.`);
+    }
+
+    const outcomes: SampleOutcome[] = [];
+    for (const to of mode.testRecipients) {
+        if (!mode.sends) {
+            outcomes.push({ to, status: "previewed", error: null });
+            continue;
+        }
+        try {
+            await input.sender(buildSampleRequest(to, input.emailConfig));
+            outcomes.push({ to, status: "sent", error: null });
+        } catch (error) {
+            outcomes.push({ to, status: "failed", error: messageOf(error) });
+        }
+    }
+    return outcomes;
 }

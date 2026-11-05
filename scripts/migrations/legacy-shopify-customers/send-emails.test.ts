@@ -7,7 +7,10 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import { join, resolve } from "node:path";
 
@@ -44,9 +47,13 @@ import { parseOrdersCsvText, readOrdersCsv } from "./orders-csv.ts";
 import {
     DEFAULT_TEST_LIMIT,
     EMAIL_OUTCOME_STATUSES,
+    SAMPLE_CUSTOMER_NAME,
+    SAMPLE_EXPIRY_DATE,
+    SAMPLE_START_DATE,
     TEST_MODE_HEADER,
     assertTargetingActionable,
     assertTestRecipientsAreNotCustomers,
+    buildSampleRequest,
     classifyWorkspace,
     countNotAttempted,
     createGuardedSender,
@@ -54,8 +61,11 @@ import {
     liveSendBlockers,
     parseSendEmailsArgs,
     planEmailRun,
+    renderSampleEmail,
     resolveSendMode,
     runEmailStage,
+    runSampleStage,
+    sampleSendBlockers,
     summarizeOutcomes,
     type ClassifyContext,
     type EmailSender,
@@ -364,6 +374,10 @@ describe("stage 2 arguments and mode resolution", () => {
             testRecipients: [],
             onlyEmails: [],
             allowMissingPlatformLinks: true,
+            sample: false,
+            sendSample: false,
+            csvExplicit: true,
+            outExplicit: true,
         });
     });
 
@@ -2173,8 +2187,10 @@ describe("stage 2 exact recipient targeting (--only-emails)", () => {
     it("the CLI passes the list into the plan and refuses an unresolvable live run before any sender exists", () => {
         const cli = readFileSync(resolve(process.cwd(), "scripts/migrations/legacy-shopify-customers/send-emails.ts"), "utf8");
         assert.match(cli, /planEmailRun\(rows, context, mode\.limit, mode\.onlyEmails\)/);
-        const refuse = cli.indexOf("assertTargetingActionable(runPlan.targeting)");
-        const sender = cli.indexOf("createGuardedSender({");
+        // Look inside main(): the sample runner above it builds its own (guarded) sender.
+        const main = cli.slice(cli.indexOf("async function main()"));
+        const refuse = main.indexOf("assertTargetingActionable(runPlan.targeting)");
+        const sender = main.indexOf("createGuardedSender({");
         assert.ok(refuse > 0 && sender > 0 && refuse < sender, "the refusal must come before the sender is created");
         assert.match(cli, /if \(mode\.sends\) assertTargetingActionable/);
     });
@@ -2261,6 +2277,687 @@ describe("pilot rehearsal: stage 1 then stage 2 for exactly two customers", () =
         assert.ok(stillPending.includes("other.large@example.com"));
         assert.ok(stillPending.includes("pilot.large+extra@example.com"));
         assert.ok(!stillPending.includes("pilot.large@example.com"));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Sample email mode: synthetic data, explicit test addresses, nothing else
+// ---------------------------------------------------------------------------
+
+const SAMPLE_ONE = "sample.one@test.example";
+const SAMPLE_TWO = "sample.two@test.example";
+const SAMPLE_PAIR = `${SAMPLE_ONE},${SAMPLE_TWO}`;
+const MIGRATION_DIR = "scripts/migrations/legacy-shopify-customers";
+const readMigrationSource = (file: string) => readFileSync(resolve(process.cwd(), MIGRATION_DIR, file), "utf8");
+
+describe("sample email mode (--sample): flags and mode", () => {
+    const modeOf = (...args: string[]) => resolveSendMode(parseSendEmailsArgs(args));
+
+    it("recognises the two flags and records whether --csv / --out were given", () => {
+        const plain = parseSendEmailsArgs(["--sample", `--test-recipients=${SAMPLE_PAIR}`]);
+        assert.deepEqual([plain.sample, plain.sendSample, plain.csvExplicit, plain.outExplicit], [true, false, false, false]);
+        const full = parseSendEmailsArgs(["--sample", "--send-sample", "--csv=x.csv", "--out=r"]);
+        assert.deepEqual([full.sample, full.sendSample, full.csvExplicit, full.outExplicit], [true, true, true, true]);
+        assert.deepEqual(parseSendEmailsArgs([]).sample, false);
+    });
+
+    it("preview is the default: --sample alone with test recipients sends nothing", () => {
+        const mode = modeOf("--sample", `--test-recipients=${SAMPLE_PAIR}`);
+        assert.deepEqual(
+            { target: mode.target, sends: mode.sends, limit: mode.limit, only: mode.onlyEmails, links: mode.allowMissingPlatformLinks },
+            { target: "sample", sends: false, limit: null, only: [], links: false }
+        );
+        assert.deepEqual(mode.testRecipients, [SAMPLE_ONE, SAMPLE_TWO]);
+    });
+
+    it("actual delivery needs the explicit --send-sample, and --dry-run still wins over it", () => {
+        assert.equal(modeOf("--sample", "--send-sample", `--test-recipients=${SAMPLE_PAIR}`).sends, true);
+        assert.equal(modeOf("--sample", "--send-sample", "--dry-run", `--test-recipients=${SAMPLE_PAIR}`).sends, false);
+        assert.equal(modeOf("--dry-run", "--sample", `--test-recipients=${SAMPLE_PAIR}`).sends, false);
+    });
+
+    it("--send-sample on its own is an error: it never delivers anything without --sample", () => {
+        assert.throws(() => modeOf("--send-sample", `--test-recipients=${SAMPLE_PAIR}`), /--send-sample requires --sample/);
+        assert.throws(() => modeOf("--send-sample"), /--send-sample requires --sample/);
+    });
+
+    it("--test-recipients is required, and the list is normalized and de-duplicated", () => {
+        assert.throws(() => modeOf("--sample"), /--sample needs --test-recipients/);
+        assert.throws(() => modeOf("--sample", "--send-sample"), /--sample needs --test-recipients/);
+        assert.throws(() => modeOf("--sample", "--test-recipients="), /at least one address/);
+        assert.throws(() => modeOf("--sample", "--test-recipients=not-an-email"), /invalid address/);
+        assert.deepEqual(modeOf("--sample", `--test-recipients= ${SAMPLE_ONE.toUpperCase()} ,${SAMPLE_ONE},${SAMPLE_TWO}`).testRecipients, [
+            SAMPLE_ONE,
+            SAMPLE_TWO,
+        ]);
+    });
+
+    it("rejects every flag that belongs to real customers or to the export, naming each one", () => {
+        const base = ["--sample", `--test-recipients=${SAMPLE_PAIR}`];
+        const conflicts: Array<[string, string]> = [
+            ["--send", "--send"],
+            ["--all", "--all"],
+            ["--limit=3", "--limit"],
+            ["--only-emails=ann@example.com", "--only-emails"],
+            ["--csv=orders_export_1.csv", "--csv"],
+            ["--out=reports", "--out"],
+            ["--allow-missing-platform-links", "--allow-missing-platform-links"],
+        ];
+        for (const [flag, name] of conflicts) {
+            for (const extra of [[], ["--send-sample"]]) {
+                assert.throws(() => modeOf(...base, ...extra, flag), (error: Error) => error.message.includes(`--sample cannot be combined with ${name}`) , `${flag} ${extra.join(" ")}`);
+            }
+        }
+        // Several conflicts are all named at once.
+        assert.throws(() => modeOf(...base, "--send", "--all", "--limit=1", "--only-emails=a@x.com"), /--send, --all, --limit, --only-emails/);
+        // The error points at the right flag for delivering a sample.
+        assert.throws(() => modeOf(...base, "--send"), /use --send-sample/);
+    });
+
+    it("can never become a customer run: every accepted sample combination resolves to target 'sample'", () => {
+        const optional = [[], ["--send-sample"], ["--dry-run"], ["--send-sample", "--dry-run"]];
+        for (const extra of optional) {
+            const mode = modeOf("--sample", `--test-recipients=${SAMPLE_PAIR}`, ...extra);
+            assert.equal(mode.target, "sample", extra.join(" "));
+            assert.deepEqual(mode.onlyEmails, []);
+        }
+        // Without --sample, --test-recipients keeps its existing (customer-rendering) meaning, and --send-sample is refused.
+        assert.equal(modeOf(`--test-recipients=${SAMPLE_PAIR}`).target, "test");
+        assert.equal(modeOf("--send", "--all").target, "live");
+    });
+});
+
+describe("sample email mode (--sample): content and delivery", () => {
+    const sampleMode = (...extra: string[]) => resolveSendMode(parseSendEmailsArgs(["--sample", `--test-recipients=${SAMPLE_PAIR}`, ...extra]));
+    const runSample = async (extra: string[], config: EmailConfig = FULL_CONFIG, log = createSenderLog()) => {
+        const mode = sampleMode(...extra);
+        const sender = createGuardedSender({ mode, liveRecipients: new Set(), rawSender: log.raw });
+        const outcomes = await runSampleStage({ mode, emailConfig: config, sender });
+        return { mode, outcomes, log };
+    };
+
+    it("renders the approved subject and body with synthetic, clearly labelled values", () => {
+        const content = renderSampleEmail(FULL_CONFIG);
+        const approved = getLegacyFreeYearEmailContent({
+            customerName: SAMPLE_CUSTOMER_NAME,
+            startDate: SAMPLE_START_DATE,
+            expiryDate: SAMPLE_EXPIRY_DATE,
+            androidUrl: FULL_CONFIG.androidUrl,
+            windowsUrl: FULL_CONFIG.windowsUrl,
+            iosUrl: FULL_CONFIG.iosUrl,
+            macosUrl: FULL_CONFIG.macosUrl,
+            supportEmail: FULL_CONFIG.supportEmail!,
+        });
+        assert.equal(content.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
+        assert.equal(content.text, approved.text);
+        assert.equal(content.html, approved.html);
+
+        assert.equal(SAMPLE_CUSTOMER_NAME, "HealthAge Test Customer");
+        assert.match(content.text, /^Hi HealthAge Test Customer,/);
+        assert.match(content.text, /Start Date: 2026-01-01 \(sample date\)/);
+        assert.match(content.text, /Expires: 2027-01-01 \(sample date\)/);
+        assert.match(content.html, /Start Date: 2026-01-01 \(sample date\)<br>/);
+        assert.match(SAMPLE_START_DATE + SAMPLE_EXPIRY_DATE, /sample date.*sample date/);
+    });
+
+    it("contains all four configured platform links (and the support address) in both the text and the HTML", () => {
+        const content = renderSampleEmail(FULL_CONFIG);
+        for (const body of [content.text, content.html]) {
+            for (const url of [FULL_CONFIG.androidUrl, FULL_CONFIG.windowsUrl, FULL_CONFIG.iosUrl, FULL_CONFIG.macosUrl]) {
+                assert.ok(body.includes(url!), `${url} missing from the sample`);
+            }
+            assert.ok(body.includes(FULL_CONFIG.supportEmail!));
+        }
+        for (const label of ["Android:", "Windows:", "iOS:", "macOS:"]) assert.ok(content.text.includes(label), label);
+        assert.doesNotMatch(content.text + content.html, /undefined|null/);
+    });
+
+    it("a sample SEND is refused unless all four links and the support address are configured, with no override", async () => {
+        assert.deepEqual(sampleSendBlockers(FULL_CONFIG), []);
+        assert.deepEqual(sampleSendBlockers(NO_APPLE_CONFIG), ["HEALTHAGE_IOS_URL is not set", "HEALTHAGE_MACOS_URL is not set"]);
+        assert.deepEqual(sampleSendBlockers({ ...FULL_CONFIG, androidUrl: null, windowsUrl: null }), [
+            "HEALTHAGE_ANDROID_URL is not set",
+            "HEALTHAGE_WINDOWS_URL is not set",
+        ]);
+        assert.ok(sampleSendBlockers({ ...FULL_CONFIG, supportEmail: null }).length > 0);
+
+        const log = createSenderLog();
+        await assert.rejects(runSample(["--send-sample"], NO_APPLE_CONFIG, log), /Sample send refused: HEALTHAGE_IOS_URL is not set; HEALTHAGE_MACOS_URL is not set/);
+        assert.deepEqual(log.attempts, [], "nothing was attempted");
+        // The live-send override does not exist for samples.
+        assert.throws(() => sampleMode("--allow-missing-platform-links", "--send-sample"), /--sample cannot be combined with --allow-missing-platform-links/);
+    });
+
+    it("a preview sends nothing, whatever the sender would have done", async () => {
+        const { outcomes, log } = await runSample([]);
+        assert.deepEqual(log.attempts, []);
+        assert.deepEqual(outcomes.map((outcome) => [outcome.to, outcome.status]), [
+            [SAMPLE_ONE, "previewed"],
+            [SAMPLE_TWO, "previewed"],
+        ]);
+        const dry = await runSample(["--send-sample", "--dry-run"]);
+        assert.deepEqual(dry.log.attempts, []);
+        assert.ok(dry.outcomes.every((outcome) => outcome.status === "previewed"));
+    });
+
+    it("the guard itself refuses a sample send in preview mode, even if the code above it is wrong", async () => {
+        const log = createSenderLog();
+        const mode = sampleMode();
+        const guarded = createGuardedSender({ mode, liveRecipients: new Set(), rawSender: log.raw });
+        await assert.rejects(guarded(buildSampleRequest(SAMPLE_ONE, FULL_CONFIG)), /preview/);
+        assert.deepEqual(log.attempts, []);
+    });
+
+    it("--send-sample delivers one synthetic email to each listed address and to nobody else", async () => {
+        const { outcomes, log } = await runSample(["--send-sample"]);
+
+        assert.deepEqual(log.attempts, [SAMPLE_ONE, SAMPLE_TWO]);
+        assert.deepEqual(outcomes.map((outcome) => outcome.status), ["sent", "sent"]);
+        for (const entry of log.sent) {
+            assert.equal(entry.request.customerName, SAMPLE_CUSTOMER_NAME);
+            assert.equal(entry.request.startDate, SAMPLE_START_DATE);
+            assert.equal(entry.request.expiryDate, SAMPLE_EXPIRY_DATE);
+            assert.equal(entry.request.supportEmail, FULL_CONFIG.supportEmail);
+            assert.deepEqual(
+                [entry.request.androidUrl, entry.request.windowsUrl, entry.request.iosUrl, entry.request.macosUrl],
+                [FULL_CONFIG.androidUrl, FULL_CONFIG.windowsUrl, FULL_CONFIG.iosUrl, FULL_CONFIG.macosUrl]
+            );
+            assert.equal(entry.headers?.[TEST_MODE_HEADER], "sample", "marked as a sample in a header, body untouched");
+        }
+        // The message is the approved template byte for byte.
+        const message = buildFreeYearMessage(log.sent[0]!.request, "from@test.invalid", log.sent[0]!.headers);
+        const content = renderSampleEmail(FULL_CONFIG);
+        assert.equal(message.subject, content.subject);
+        assert.equal(message.text, content.text);
+        assert.equal(message.html, content.html);
+    });
+
+    it("exact recipient allowlist: the guard refuses any address that is not listed, however it is spelled", async () => {
+        const log = createSenderLog();
+        const mode = sampleMode("--send-sample");
+        const guarded = createGuardedSender({ mode, liveRecipients: new Set(["ann@example.com"]), rawSender: log.raw });
+
+        for (const stranger of ["ann@example.com", "sample.one+x@test.example", "ample.one@test.example", "sample.one@test.example.org", "sample.three@test.example"]) {
+            await assert.rejects(guarded(buildSampleRequest(stranger, FULL_CONFIG)), /not on the test recipient allowlist/, stranger);
+        }
+        await guarded(buildSampleRequest("SAMPLE.ONE@TEST.EXAMPLE", FULL_CONFIG));
+        assert.deepEqual(log.attempts, ["SAMPLE.ONE@TEST.EXAMPLE"], "only the listed address, case-insensitively");
+    });
+
+    it("duplicate and differently-cased recipients get exactly one email", async () => {
+        const mode = resolveSendMode(
+            parseSendEmailsArgs(["--sample", "--send-sample", `--test-recipients=${SAMPLE_ONE.toUpperCase()},${SAMPLE_ONE},${SAMPLE_ONE}`])
+        );
+        const log = createSenderLog();
+        const outcomes = await runSampleStage({
+            mode,
+            emailConfig: FULL_CONFIG,
+            sender: createGuardedSender({ mode, liveRecipients: new Set(), rawSender: log.raw }),
+        });
+        assert.equal(outcomes.length, 1);
+        assert.deepEqual(log.attempts, [SAMPLE_ONE]);
+    });
+
+    it("one failing address does not stop the other, and is reported as failed", async () => {
+        const { outcomes, log } = await runSample(["--send-sample"], FULL_CONFIG, createSenderLog([SAMPLE_ONE]));
+        assert.deepEqual(log.attempts, [SAMPLE_ONE, SAMPLE_TWO]);
+        assert.deepEqual(outcomes.map((outcome) => outcome.status), ["failed", "sent"]);
+        assert.match(outcomes[0]?.error ?? "", /451/);
+    });
+
+    it("the live stage runner refuses a sample mode, so it can never fall through to customers or the ledger", async () => {
+        const db = createLedgerDb(standardRows());
+        const log = createSenderLog();
+        const mode = sampleMode("--send-sample");
+        const everyone = planEmailRun(db.rows(), CONTEXT, null);
+        await assert.rejects(
+            runEmailStage({
+                mode,
+                selected: everyone.selected,
+                emailConfig: FULL_CONFIG,
+                sender: createGuardedSender({ mode, liveRecipients: new Set(everyone.selected.map((c) => c.email)), rawSender: log.raw }),
+                ledger: db.runner,
+                context: CONTEXT,
+            }),
+            /does not handle sample mode/
+        );
+        assert.deepEqual(log.attempts, []);
+        assert.equal(db.transactions(), 0, "no ledger transaction, no lock");
+        assert.equal(db.ledgerWrites(), 0);
+    });
+
+    it("the sample runner only runs sample modes", async () => {
+        const log = createSenderLog();
+        for (const args of [["--send", "--all"], [`--test-recipients=${SAMPLE_PAIR}`], ["--dry-run"]]) {
+            const mode = resolveSendMode(parseSendEmailsArgs(args));
+            await assert.rejects(
+                runSampleStage({ mode, emailConfig: FULL_CONFIG, sender: createGuardedSender({ mode, liveRecipients: new Set(), rawSender: log.raw }) }),
+                /only runs in sample mode/,
+                args.join(" ")
+            );
+        }
+        assert.deepEqual(log.attempts, []);
+    });
+
+    it("existing modes are unchanged: test mode still carries the 'test' marker and the live guard still guards", async () => {
+        const log = createSenderLog();
+        const test = resolveSendMode(parseSendEmailsArgs([`--test-recipients=${SAMPLE_ONE}`]));
+        await createGuardedSender({ mode: test, liveRecipients: new Set(), rawSender: log.raw })(buildSampleRequest(SAMPLE_ONE, FULL_CONFIG));
+        assert.equal(log.sent[0]?.headers?.[TEST_MODE_HEADER], "test");
+
+        const live = resolveSendMode(parseSendEmailsArgs(["--send", "--limit=1"]));
+        await assert.rejects(
+            createGuardedSender({ mode: live, liveRecipients: new Set(["ann@example.com"]), rawSender: log.raw })(buildSampleRequest(SAMPLE_ONE, FULL_CONFIG)),
+            /not a selected pending/
+        );
+    });
+});
+
+describe("sample email mode (--sample): isolation from the database, the export and the ledger", () => {
+    it("the sample code takes no customer, database, export or ledger and calls none", () => {
+        const core = readMigrationSource("send-emails-core.ts");
+        const section = core.slice(core.indexOf("// Sample email: synthetic data"));
+        assert.ok(section.length > 500 && section.includes("runSampleStage"), "found the sample section");
+        for (const forbidden of [
+            "LedgerRunner",
+            "LedgerTransaction",
+            "recordEmailSent",
+            "claimWorkspace",
+            "runInTransaction",
+            "MigratedWorkspaceRow",
+            "EmailCandidate",
+            "planEmailRun",
+            "classifyWorkspace",
+            "readOrdersCsv",
+            "Pool",
+        ]) {
+            assert.equal(section.includes(forbidden), false, `the sample section must not use ${forbidden}`);
+        }
+    });
+
+    it("the CLI's sample path touches no database, export, report folder or ledger", () => {
+        const cli = readMigrationSource("send-emails.ts");
+        const samplePath = cli.slice(cli.indexOf("async function runSampleMode"), cli.indexOf("async function main()"));
+        assert.ok(samplePath.includes("runSampleStage") && samplePath.includes("printSampleSummary"));
+        for (const forbidden of [
+            "Pool",
+            "loadMigratedWorkspaces",
+            "createPgLedgerRunner",
+            "readOrdersCsv",
+            "buildMigrationPlan",
+            "mkdirSync",
+            "writeFileSync",
+            "DATABASE_URL",
+            "planEmailRun",
+            "runEmailStage",
+            "writeReport",
+        ]) {
+            assert.equal(samplePath.includes(forbidden), false, `the sample path must not use ${forbidden}`);
+        }
+    });
+
+    it("main() decides sample mode before it ever looks at DATABASE_URL, the CSV, the pool or the report folder", () => {
+        const cli = readMigrationSource("send-emails.ts");
+        const main = cli.slice(cli.indexOf("async function main()"));
+        const branch = main.indexOf('mode.target === "sample"');
+        assert.ok(branch > 0, "main has a sample branch");
+        for (const later of ["liveSendBlockers(", "process.env.DATABASE_URL", "readOrdersCsv(", "new Pool(", "mkdirSync(", "writeReport("]) {
+            const at = main.indexOf(later);
+            assert.ok(at > branch, `${later} must come after the sample branch`);
+        }
+        assert.match(main.slice(branch, branch + 200), /await runSampleMode\(mode, emailConfig\);\s*return;/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Sample mode end to end: the REAL CLI in a subprocess, against loopback traps only.
+//
+// The child gets a sanitized environment (never process.env): DATABASE_URL points at a TCP
+// listener that counts connection attempts, SMTP points at a fake SMTP server that records
+// every recipient and message, and the working directory is an empty temp folder (no CSV, no
+// report folder). Nothing here can reach a real database or mail server.
+// ---------------------------------------------------------------------------
+
+type FakeSmtp = {
+    port: number;
+    connections: number;
+    rcpts: string[];
+    messages: string[];
+    close(): Promise<void>;
+};
+
+function listen(server: Server): Promise<number> {
+    return new Promise((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(0, "127.0.0.1", () => resolveListen((server.address() as { port: number }).port));
+    });
+}
+
+const closeServer = (server: Server) => new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+
+/** A minimal SMTP server: accepts everything (except recipients in `reject`), records every accepted recipient and message. */
+async function startFakeSmtp(options: { reject?: readonly string[] } = {}): Promise<FakeSmtp> {
+    const rejected = new Set((options.reject ?? []).map((address) => address.toLowerCase()));
+    const state = { connections: 0, rcpts: [] as string[], messages: [] as string[] };
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        state.connections += 1;
+        let buffer = "";
+        let inData = false;
+        let authStep: "none" | "user" | "pass" = "none";
+        const reply = (line: string) => socket.write(`${line}\r\n`);
+        reply("220 sample.test ESMTP ready");
+
+        socket.on("data", (chunk) => {
+            buffer += chunk.toString("latin1");
+            for (;;) {
+                if (inData) {
+                    const end = buffer.indexOf("\r\n.\r\n");
+                    if (end < 0) return;
+                    state.messages.push(buffer.slice(0, end).replace(/\r\n\.\./g, "\r\n."));
+                    buffer = buffer.slice(end + 5);
+                    inData = false;
+                    reply("250 2.0.0 queued");
+                    continue;
+                }
+                const eol = buffer.indexOf("\r\n");
+                if (eol < 0) return;
+                const line = buffer.slice(0, eol);
+                buffer = buffer.slice(eol + 2);
+
+                if (authStep === "user") {
+                    authStep = "pass";
+                    reply("334 UGFzc3dvcmQ6");
+                } else if (authStep === "pass") {
+                    authStep = "none";
+                    reply("235 2.7.0 authenticated");
+                } else if (/^EHLO/i.test(line)) {
+                    socket.write("250-sample.test\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n");
+                } else if (/^HELO/i.test(line)) {
+                    reply("250 sample.test");
+                } else if (/^AUTH PLAIN/i.test(line)) {
+                    reply("235 2.7.0 authenticated");
+                } else if (/^AUTH LOGIN/i.test(line)) {
+                    authStep = "user";
+                    reply("334 VXNlcm5hbWU6");
+                } else if (/^RCPT TO:/i.test(line)) {
+                    const address = /<([^>]*)>/.exec(line)?.[1] ?? line;
+                    if (rejected.has(address.toLowerCase())) {
+                        reply("550 5.1.1 mailbox unavailable");
+                    } else {
+                        state.rcpts.push(address);
+                        reply("250 2.1.5 ok");
+                    }
+                } else if (/^DATA/i.test(line)) {
+                    inData = true;
+                    reply("354 end with <CRLF>.<CRLF>");
+                } else if (/^QUIT/i.test(line)) {
+                    reply("221 2.0.0 bye");
+                    socket.end();
+                } else {
+                    reply("250 2.0.0 ok");
+                }
+            }
+        });
+        socket.on("error", () => undefined);
+    });
+    const port = await listen(server);
+    return {
+        port,
+        get connections() {
+            return state.connections;
+        },
+        get rcpts() {
+            return state.rcpts;
+        },
+        get messages() {
+            return state.messages;
+        },
+        close: async () => {
+            for (const socket of sockets) socket.destroy();
+            await closeServer(server);
+        },
+    };
+}
+
+/** Stands in for PostgreSQL: counts connection attempts and hangs up. */
+async function startDatabaseTrap(): Promise<{ port: number; attempts: () => number; close(): Promise<void> }> {
+    let attempts = 0;
+    const server = createServer((socket) => {
+        attempts += 1;
+        socket.destroy();
+    });
+    const port = await listen(server);
+    return { port, attempts: () => attempts, close: () => closeServer(server) };
+}
+
+const OS_ENV_KEYS = ["PATH", "Path", "SystemRoot", "SYSTEMROOT", "windir", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG"];
+
+function sanitizedEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {};
+    for (const key of OS_ENV_KEYS) if (process.env[key] !== undefined) env[key] = process.env[key];
+    return { ...env, ...extra };
+}
+
+/** Runs the real send-emails.ts under tsx in `cwd` with exactly `env`. */
+function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const tsx = resolve(process.cwd(), "node_modules/tsx/dist/cli.mjs");
+    const script = resolve(process.cwd(), MIGRATION_DIR, "send-emails.ts");
+    assert.ok(existsSync(tsx), "tsx is installed");
+    return new Promise((resolveRun, rejectRun) => {
+        const child = spawn(process.execPath, [tsx, script, ...args], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => (stdout += chunk));
+        child.stderr.on("data", (chunk) => (stderr += chunk));
+        const timer = setTimeout(() => {
+            child.kill();
+            rejectRun(new Error(`CLI timed out. stdout:\n${stdout}\nstderr:\n${stderr}`));
+        }, 90_000);
+        child.on("error", rejectRun);
+        child.on("close", (code) => {
+            clearTimeout(timer);
+            // Let any loopback connection the child made just before exiting reach the traps' counters.
+            setTimeout(() => resolveRun({ code, stdout, stderr }), 150);
+        });
+    });
+}
+
+/** Decodes the text/plain and text/html parts of a captured message. */
+function decodeMessage(raw: string): { headers: Record<string, string>; text: string; html: string } {
+    const split = (value: string): [string, string] => {
+        const at = value.indexOf("\r\n\r\n");
+        return at < 0 ? [value, ""] : [value.slice(0, at), value.slice(at + 4)];
+    };
+    const parseHeaders = (block: string) => {
+        const headers: Record<string, string> = {};
+        for (const line of block.replace(/\r\n[ \t]+/g, " ").split("\r\n")) {
+            const colon = line.indexOf(":");
+            if (colon > 0) headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+        }
+        return headers;
+    };
+    const decodeBody = (body: string, encoding: string | undefined): string => {
+        if (/quoted-printable/i.test(encoding ?? "")) {
+            const joined = body.replace(/=\r?\n/g, "");
+            const bytes: number[] = [];
+            for (let i = 0; i < joined.length; i++) {
+                const hex = joined.slice(i + 1, i + 3);
+                if (joined[i] === "=" && /^[0-9A-Fa-f]{2}$/.test(hex)) {
+                    bytes.push(parseInt(hex, 16));
+                    i += 2;
+                } else bytes.push(joined.charCodeAt(i));
+            }
+            return Buffer.from(bytes).toString("utf8");
+        }
+        if (/base64/i.test(encoding ?? "")) return Buffer.from(body.replace(/\s+/g, ""), "base64").toString("utf8");
+        return Buffer.from(body, "latin1").toString("utf8");
+    };
+
+    const [head, body] = split(raw);
+    const headers = parseHeaders(head);
+    const boundary = /boundary="?([^";\r\n]+)"?/i.exec(headers["content-type"] ?? "")?.[1];
+    let text = "";
+    let html = "";
+    const parts = boundary ? body.split(`--${boundary}`).slice(1, -1) : [raw];
+    for (const part of parts) {
+        const [partHead, partBody] = split(part.replace(/^\r\n/, ""));
+        const partHeaders = parseHeaders(partHead);
+        const decoded = decodeBody(partBody, partHeaders["content-transfer-encoding"]);
+        if (/text\/plain/i.test(partHeaders["content-type"] ?? "")) text = decoded;
+        if (/text\/html/i.test(partHeaders["content-type"] ?? "")) html = decoded;
+    }
+    return { headers, text, html };
+}
+
+describe("sample email mode (--sample): the real CLI against loopback traps", () => {
+    // FULL_CONFIG has all four links set; these are the strings the child process is given.
+    const FOUR_LINKS = [FULL_CONFIG.androidUrl!, FULL_CONFIG.windowsUrl!, FULL_CONFIG.iosUrl!, FULL_CONFIG.macosUrl!];
+    const LINKS = {
+        HEALTHAGE_ANDROID_URL: FOUR_LINKS[0]!,
+        HEALTHAGE_WINDOWS_URL: FOUR_LINKS[1]!,
+        HEALTHAGE_IOS_URL: FOUR_LINKS[2]!,
+        HEALTHAGE_MACOS_URL: FOUR_LINKS[3]!,
+        HEALTHAGE_SUPPORT_EMAIL: FULL_CONFIG.supportEmail!,
+    };
+
+    async function withTraps<T>(
+        body: (ctx: { cwd: string; smtp: FakeSmtp; db: Awaited<ReturnType<typeof startDatabaseTrap>>; env: (extra?: Record<string, string>) => NodeJS.ProcessEnv }) => Promise<T>,
+        smtpOptions: { reject?: readonly string[] } = {}
+    ): Promise<T> {
+        const smtp = await startFakeSmtp(smtpOptions);
+        const db = await startDatabaseTrap();
+        const cwd = mkdtempSync(join(tmpdir(), "healthage-sample-"));
+        const env = (extra: Record<string, string> = {}) =>
+            sanitizedEnv({
+                DATABASE_URL: `postgres://trap:trap@127.0.0.1:${db.port}/trap`,
+                SMTP_HOST: "127.0.0.1",
+                SMTP_PORT: String(smtp.port),
+                SMTP_USER: "sample-user",
+                SMTP_PASS: "sample-pass",
+                EMAIL_FROM: "HealthAge Sample <noreply@sample.test>",
+                ...LINKS,
+                ...extra,
+            });
+        try {
+            return await body({ cwd, smtp, db, env });
+        } finally {
+            await smtp.close();
+            await db.close();
+            rmSync(cwd, { recursive: true, force: true });
+        }
+    }
+
+    it("PREVIEW: prints the sample email, contacts neither the database nor the mail server, reads no CSV and writes nothing", async () => {
+        await withTraps(async ({ cwd, smtp, db, env }) => {
+            const result = await runCli(cwd, env(), ["--sample", `--test-recipients=${SAMPLE_PAIR}`]);
+
+            assert.equal(result.code, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+            assert.match(result.stdout, /SAMPLE PREVIEW — nothing is sent/);
+            assert.match(result.stdout, /No email was sent/);
+            assert.ok(result.stdout.includes(`${SAMPLE_ONE}, ${SAMPLE_TWO}`));
+            assert.ok(result.stdout.includes("Subject: Your 1 year of FREE access to the new Discover Your Health Age App"));
+            assert.match(result.stdout, /Hi HealthAge Test Customer,/);
+            assert.match(result.stdout, /Start Date: 2026-01-01 \(sample date\)/);
+            for (const url of FOUR_LINKS) {
+                assert.ok(result.stdout.includes(url), `preview must show ${url}`);
+            }
+            assert.equal(db.attempts(), 0, "PostgreSQL must never be contacted");
+            assert.equal(smtp.connections, 0, "a preview must not even open a mail connection");
+            assert.deepEqual(readdirSync(cwd), [], "no report folder, no CSV, nothing written in the working directory");
+        });
+    });
+
+    it("SAMPLE SEND: the fake mail server receives exactly the listed addresses, the approved template, and no database is touched", async () => {
+        await withTraps(async ({ cwd, smtp, db, env }) => {
+            const result = await runCli(cwd, env(), ["--sample", "--send-sample", `--test-recipients=${SAMPLE_PAIR}`]);
+
+            assert.equal(result.code, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+            assert.match(result.stdout, /Delivered to 2 of 2 address\(es\)/);
+            assert.deepEqual([...smtp.rcpts].sort(), [SAMPLE_ONE, SAMPLE_TWO], "exactly the two listed recipients, nobody else");
+            assert.equal(smtp.messages.length, 2);
+
+            const approved = renderSampleEmail(FULL_CONFIG);
+            const normalize = (value: string) => value.replace(/\r\n/g, "\n").trimEnd();
+            const toHeaders: string[] = [];
+            for (const raw of smtp.messages) {
+                const message = decodeMessage(raw);
+                toHeaders.push(message.headers["to"] ?? "");
+                assert.equal(message.headers["subject"], approved.subject);
+                assert.equal(message.headers["x-healthage-migration-email-mode"], "sample");
+                assert.ok((message.headers["from"] ?? "").includes("noreply@sample.test"));
+                assert.equal(normalize(message.text), normalize(approved.text), "text part is the approved template with sample values");
+                assert.equal(normalize(message.html), normalize(approved.html), "html part is the approved template with sample values");
+                for (const url of FOUR_LINKS) {
+                    assert.ok(message.text.includes(url) && message.html.includes(url), `${url} missing from the delivered message`);
+                }
+                assert.ok(message.text.includes(FULL_CONFIG.supportEmail!));
+            }
+            assert.deepEqual(toHeaders.map((value) => value.replace(/.*<|>.*/g, "")).sort(), [SAMPLE_ONE, SAMPLE_TWO]);
+
+            assert.equal(db.attempts(), 0, "PostgreSQL must never be contacted");
+            assert.deepEqual(readdirSync(cwd), [], "nothing written: no report, no CSV");
+        });
+    });
+
+    it("SAMPLE SEND with one link missing is refused before the mail server is contacted", async () => {
+        await withTraps(async ({ cwd, smtp, db, env }) => {
+            const environment = env();
+            delete environment.HEALTHAGE_IOS_URL;
+            const result = await runCli(cwd, environment, ["--sample", "--send-sample", `--test-recipients=${SAMPLE_PAIR}`]);
+
+            assert.equal(result.code, 1);
+            assert.match(result.stderr, /Sample send refused: HEALTHAGE_IOS_URL is not set/);
+            assert.match(result.stderr, /a sample must show all four platform links/, "the CLI's own, explanatory refusal");
+            assert.equal(smtp.connections, 0);
+            assert.equal(db.attempts(), 0);
+
+            // The preview of the same thing still works and says what is wrong.
+            const preview = await runCli(cwd, environment, ["--sample", `--test-recipients=${SAMPLE_PAIR}`]);
+            assert.equal(preview.code, 0);
+            assert.match(preview.stdout, /iOS\s+NOT SET/);
+            assert.match(preview.stdout, /A SAMPLE SEND WOULD BE REFUSED: HEALTHAGE_IOS_URL is not set/);
+            assert.equal(smtp.connections, 0);
+        });
+    });
+
+    it("SAMPLE SEND when the mail server rejects one address: that address is reported failed, the other is still delivered, and the exit code is 1", async () => {
+        await withTraps(
+            async ({ cwd, smtp, db, env }) => {
+                const result = await runCli(cwd, env(), ["--sample", "--send-sample", `--test-recipients=${SAMPLE_PAIR}`]);
+
+                assert.equal(result.code, 1, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+                assert.match(result.stdout, new RegExp(`failed\\s+${SAMPLE_ONE.replace(/\./g, "\\.")}`));
+                assert.match(result.stdout, new RegExp(`sent\\s+${SAMPLE_TWO.replace(/\./g, "\\.")}`));
+                assert.match(result.stdout, /Delivered to 1 of 2 address\(es\)/);
+                assert.deepEqual(smtp.rcpts, [SAMPLE_TWO], "only the accepted listed address received a message");
+                assert.equal(db.attempts(), 0);
+            },
+            { reject: [SAMPLE_ONE] }
+        );
+    });
+
+    it("conflicting flags are rejected with a non-zero exit before anything is contacted", async () => {
+        await withTraps(async ({ cwd, smtp, db, env }) => {
+            for (const args of [
+                ["--sample", "--send", `--test-recipients=${SAMPLE_PAIR}`],
+                ["--sample", "--send-sample", "--all", `--test-recipients=${SAMPLE_PAIR}`],
+                ["--sample", "--limit=1", `--test-recipients=${SAMPLE_PAIR}`],
+                ["--sample", "--only-emails=ann@example.com", `--test-recipients=${SAMPLE_PAIR}`],
+                ["--sample", "--csv=orders_export_1.csv", `--test-recipients=${SAMPLE_PAIR}`],
+                ["--sample", "--send-sample"],
+                ["--send-sample", `--test-recipients=${SAMPLE_PAIR}`],
+            ]) {
+                const result = await runCli(cwd, env(), args);
+                assert.equal(result.code, 1, args.join(" "));
+                assert.match(result.stderr, /--sample|--send-sample/, args.join(" "));
+            }
+            assert.equal(smtp.connections, 0);
+            assert.equal(db.attempts(), 0);
+            assert.deepEqual(readdirSync(cwd), []);
+        });
     });
 });
 

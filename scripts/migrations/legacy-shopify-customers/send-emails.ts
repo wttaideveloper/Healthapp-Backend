@@ -12,6 +12,12 @@
  *   --send --limit=N | --send --all  LIVE: emails the customers, records each success
  *   --send --only-emails=a@x.com,... LIVE PILOT: emails EXACTLY those customers and nobody else
  *                                    (without --send it is a preview of exactly that list)
+ *   --sample --test-recipients=...   SAMPLE PREVIEW: shows the approved email filled with synthetic
+ *                                    data. Sends nothing. No database, no CSV, no ledger.
+ *   --sample --send-sample --test-recipients=...
+ *                                    SAMPLE SEND: delivers that synthetic email to ONLY those addresses
+ *
+ * Sample mode is decided in main() before the database, the CSV or the report folder is touched.
  *
  * The database is only read, except for one `UPDATE workspaces SET notes` per
  * successfully emailed customer in a live send. No users, members or workspaces
@@ -31,6 +37,9 @@ import { readSmtpSettings, sendFreeYearEmail } from "./email-transport";
 import { readOrdersCsv, toCsvLine } from "./orders-csv";
 import { APPLY_SCOPE, GRANT_CONFIG } from "./product-eligibility";
 import {
+    SAMPLE_CUSTOMER_NAME,
+    SAMPLE_EXPIRY_DATE,
+    SAMPLE_START_DATE,
     SKIP_REASONS,
     assertTargetingActionable,
     assertTestRecipientsAreNotCustomers,
@@ -40,8 +49,11 @@ import {
     liveSendBlockers,
     parseSendEmailsArgs,
     planEmailRun,
+    renderSampleEmail,
     resolveSendMode,
     runEmailStage,
+    runSampleStage,
+    sampleSendBlockers,
     summarizeOutcomes,
     type EmailOutcome,
     type EmailRunPlan,
@@ -49,6 +61,7 @@ import {
     type LedgerTransaction,
     type LockedWorkspaceRow,
     type MigratedWorkspaceRow,
+    type SampleOutcome,
     type SendMode,
 } from "./send-emails-core";
 
@@ -294,11 +307,99 @@ function printSummary(input: {
     else if (mode.target === "test") console.log("No customer was contacted. No database rows were changed.\n");
 }
 
+/**
+ * `--sample`: synthetic data, explicit test addresses, nothing else. Deliberately free of the
+ * database, the CSV, the report folder and the ledger: it does not use `Pool`, `readOrdersCsv`,
+ * `mkdirSync` or `writeFileSync`, and `main` calls it before any of them.
+ */
+async function runSampleMode(mode: SendMode, emailConfig: EmailConfig): Promise<void> {
+    const blockers = sampleSendBlockers(emailConfig);
+    if (mode.sends) {
+        // Refuse before the mail server is contacted. There is no override: a sample must show all four links.
+        if (blockers.length > 0) {
+            throw new Error(
+                `Sample send refused: ${blockers.join("; ")}. Set the missing values in the environment; a sample must show all four platform links.`
+            );
+        }
+        readSmtpSettings(process.env);
+    }
+
+    const sender = createGuardedSender({
+        mode,
+        liveRecipients: new Set(), // a sample has no customers
+        rawSender: (request, options) =>
+            sendFreeYearEmail(request, { env: process.env, createTransport: (config) => nodemailer.createTransport(config) }, options),
+    });
+    const outcomes = await runSampleStage({ mode, emailConfig, sender });
+
+    printSampleSummary({ mode, emailConfig, blockers, outcomes });
+    process.exitCode = outcomes.some((outcome) => outcome.status === "failed") ? 1 : 0;
+}
+
+function printSampleSummary(input: {
+    mode: SendMode;
+    emailConfig: EmailConfig;
+    blockers: readonly string[];
+    outcomes: readonly SampleOutcome[];
+}): void {
+    const { mode, emailConfig } = input;
+    const content = renderSampleEmail(emailConfig);
+    const link = (label: string, url: string | null) => console.log(`    ${label.padEnd(8)} ${url ?? "NOT SET"}`);
+
+    console.log("");
+    console.log("=".repeat(78));
+    console.log("  LEGACY SHOPIFY MIGRATION — SAMPLE EMAIL (synthetic data)");
+    console.log("=".repeat(78));
+    console.log(
+        mode.sends
+            ? "  MODE     : SAMPLE SEND — delivers the sample email to the addresses below, and ONLY those."
+            : "  MODE     : SAMPLE PREVIEW — nothing is sent. Add --send-sample to deliver it."
+    );
+    console.log("             No customers, database, CSV, workspaces or email ledger are involved.");
+    console.log("");
+    console.log(`  Recipients (${mode.testRecipients.length}, exactly as given): ${mode.testRecipients.join(", ")}`);
+    console.log(`  Sample customer : ${SAMPLE_CUSTOMER_NAME}`);
+    console.log(`  Sample dates    : ${SAMPLE_START_DATE}  ->  ${SAMPLE_EXPIRY_DATE}`);
+    console.log(`  Support address : ${emailConfig.supportEmail ?? "NOT SET"}`);
+    console.log(`  From            : ${process.env.EMAIL_FROM?.trim() || "(the SMTP user)"}`);
+    console.log("  Platform links  :");
+    link("Android", emailConfig.androidUrl);
+    link("Windows", emailConfig.windowsUrl);
+    link("iOS", emailConfig.iosUrl);
+    link("macOS", emailConfig.macosUrl);
+    if (input.blockers.length > 0) {
+        console.log(`  !! A SAMPLE SEND WOULD BE REFUSED: ${input.blockers.join("; ")}`);
+    }
+    console.log("");
+    console.log(`  Subject: ${content.subject}`);
+    console.log("  Body (plain-text part):");
+    for (const textLine of content.text.split("\n")) console.log(`  | ${textLine}`);
+    console.log("");
+
+    for (const outcome of input.outcomes) {
+        console.log(`  ${outcome.status.padEnd(10)} ${outcome.to}${outcome.error ? `  ERROR: ${outcome.error}` : ""}`);
+    }
+    console.log("");
+    if (!mode.sends) {
+        console.log("No email was sent. Nothing was read from or written to a database, a CSV or a ledger.\n");
+    } else {
+        console.log(`Delivered to ${input.outcomes.filter((outcome) => outcome.status === "sent").length} of ${input.outcomes.length} address(es).`);
+        console.log("No customer was contacted. Nothing was read from or written to a database, a CSV or a ledger.\n");
+    }
+}
+
 async function main(): Promise<void> {
     const args = parseSendEmailsArgs(process.argv.slice(2));
     const mode = resolveSendMode(args);
     const runDate = new Date();
     const emailConfig = readEmailConfig(process.env);
+
+    // Sample mode never reaches the code below: no DATABASE_URL, no Pool, no CSV, no report folder.
+    if (mode.target === "sample") {
+        await runSampleMode(mode, emailConfig);
+        return;
+    }
+
     const blockers = liveSendBlockers(emailConfig, mode);
     const liveSend = mode.sends && mode.target === "live";
 
