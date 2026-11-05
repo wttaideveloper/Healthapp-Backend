@@ -42,17 +42,22 @@ import {
     type SmtpTransportConfig,
     type TransportDeps,
 } from "./email-transport.ts";
-import { getLegacyFreeYearEmailContent } from "./migration-email.ts";
+import { getLegacyFreeYearEmailContent, type PurchaseSummary } from "./migration-email.ts";
 import { parseOrdersCsvText, readOrdersCsv } from "./orders-csv.ts";
+import { ELIGIBLE_PRODUCTS } from "./product-eligibility.ts";
+import { buildPurchaseIndex } from "./purchase-summary.ts";
 import {
     DEFAULT_TEST_LIMIT,
     EMAIL_OUTCOME_STATUSES,
+    SAMPLE_ACCOUNT_EMAIL,
     SAMPLE_CUSTOMER_NAME,
     SAMPLE_EXPIRY_DATE,
     SAMPLE_START_DATE,
+    SAMPLE_WORKSPACE_NAME,
     TEST_MODE_HEADER,
     assertTargetingActionable,
     assertTestRecipientsAreNotCustomers,
+    buildSamplePurchase,
     buildSampleRequest,
     classifyWorkspace,
     countNotAttempted,
@@ -98,7 +103,13 @@ const NAMES = new Map<string, string>([
     ["dee@example.com", "Dee Doyle"],
     ["eve@example.com", ""],
 ]);
-const CONTEXT = { nameByEmail: NAMES, now: NOW };
+/** A 1-license software purchase: matches `row()`'s default seat_limit of 1. */
+const ONE_LICENSE: PurchaseSummary = {
+    licenses: 1,
+    lines: [{ kind: "dyha", label: "Discover Your Health Age", units: 1, licenses: 1 }],
+};
+const PURCHASES = new Map<string, PurchaseSummary>([...NAMES.keys()].map((email) => [email, ONE_LICENSE]));
+const CONTEXT = { nameByEmail: NAMES, purchaseByEmail: PURCHASES, now: NOW };
 
 function row(id: string, email: string, overrides: Partial<MigratedWorkspaceRow> = {}): MigratedWorkspaceRow {
     return {
@@ -110,6 +121,7 @@ function row(id: string, email: string, overrides: Partial<MigratedWorkspaceRow>
         expires_at: EXPIRES,
         notes: "Legacy Shopify migration — order(s) #1",
         billing_source: "legacy_shopify_migration",
+        seat_limit: 1,
         owner_member_status: "invited",
         user_status: null,
         ...overrides,
@@ -168,12 +180,14 @@ function createLedgerDb(initial: readonly MigratedWorkspaceRow[]) {
                     return current
                         ? {
                               id: current.id,
+                              name: current.name,
                               owner_email: current.owner_email,
                               status: current.status,
                               subscription_status: current.subscription_status,
                               expires_at: current.expires_at,
                               notes: current.notes,
                               billing_source: current.billing_source,
+                              seat_limit: current.seat_limit,
                           }
                         : null;
                 },
@@ -376,6 +390,7 @@ describe("stage 2 arguments and mode resolution", () => {
             allowMissingPlatformLinks: true,
             sample: false,
             sendSample: false,
+            sampleProduct: null,
             csvExplicit: true,
             outExplicit: true,
         });
@@ -533,6 +548,9 @@ function baseRequest(overrides: Partial<FreeYearEmailRequest> = {}): FreeYearEma
     return {
         to: "ann@example.com",
         customerName: "Ann Archer",
+        accountEmail: "ann@example.com",
+        workspaceName: "Org",
+        purchase: ONE_LICENSE,
         startDate: "2026-11-04",
         expiryDate: "2027-11-04",
         androidUrl: FULL_CONFIG.androidUrl,
@@ -1037,6 +1055,9 @@ describe("stage 2 test mode (--test-recipients)", () => {
         const request = log.sent[0]!.request;
         const approved = getLegacyFreeYearEmailContent({
             customerName: request.customerName,
+            accountEmail: request.accountEmail,
+            workspaceName: request.workspaceName,
+            purchase: request.purchase,
             startDate: request.startDate,
             expiryDate: request.expiryDate,
             androidUrl: request.androidUrl,
@@ -1152,12 +1173,12 @@ describe("stage 2 mail transport (no real SMTP)", () => {
 
         const full = withApple.calls[0]!.message.text;
         const reduced = withoutApple.calls[0]!.message.text;
-        assert.match(full, /iOS:\nhttps:\/\/apps\.apple\.com\/example-ios/);
-        assert.match(full, /macOS:\nhttps:\/\/apps\.apple\.com\/example-macos/);
+        assert.match(full, /iOS: https:\/\/apps\.apple\.com\/example-ios/);
+        assert.match(full, /macOS: https:\/\/apps\.apple\.com\/example-macos/);
         assert.doesNotMatch(reduced, /\biOS:|\bmacOS:/);
         for (const text of [full, reduced]) {
-            assert.match(text, /Android:\nhttps:\/\/play\.google\.com/);
-            assert.match(text, /Windows:\nhttps:\/\/apps\.microsoft\.com/);
+            assert.match(text, /Android: https:\/\/play\.google\.com/);
+            assert.match(text, /Windows: https:\/\/apps\.microsoft\.com/);
         }
     });
 
@@ -1283,27 +1304,29 @@ describe("stage 1 (--apply --no-email) followed by stage 2, on orders_export_1.c
             expires_at: workspace.expires_at,
             notes: workspace.notes,
             billing_source: workspace.billing_source,
+            seat_limit: workspace.seat_limit,
             owner_member_status: members.find((member) => member.workspaceId === workspace.id)?.status ?? null,
             user_status: null,
         }));
         const nameByEmail = new Map(plan.customers.filter((customer) => customer.email).map((customer) => [customer.email, customer.customerName]));
-        return { rows, nameByEmail, stageOneEmails, plan };
+        const purchaseByEmail = buildPurchaseIndex(plan.customers);
+        return { rows, nameByEmail, purchaseByEmail, stageOneEmails, plan };
     }
 
     it("stage 1 with --no-email leaves all 39 customers pending and sends nothing", async () => {
-        const { rows, nameByEmail, stageOneEmails } = await runStageOne();
+        const { rows, nameByEmail, purchaseByEmail, stageOneEmails } = await runStageOne();
         assert.equal(stageOneEmails, 0);
         assert.equal(rows.length, 39);
         assert.ok(rows.every((workspace) => !notesIndicateFreeYearEmailSent(workspace.notes)));
 
-        const pending = planEmailRun(rows, { nameByEmail, now: new Date("2026-11-10T00:00:00.000Z") }, null);
+        const pending = planEmailRun(rows, { nameByEmail, purchaseByEmail, now: new Date("2026-11-10T00:00:00.000Z") }, null);
         assert.equal(pending.pending.length, 39);
         assert.equal(pending.skipped.length, 0);
     });
 
     it("test send -> controlled live batches -> everyone done, nobody twice, ledger recorded for exactly the sent", async () => {
-        const { rows, nameByEmail } = await runStageOne();
-        const context = { nameByEmail, now: new Date("2026-11-10T00:00:00.000Z") };
+        const { rows, nameByEmail, purchaseByEmail } = await runStageOne();
+        const context = { nameByEmail, purchaseByEmail, now: new Date("2026-11-10T00:00:00.000Z") };
         const db = createLedgerDb(rows);
 
         const run = async (args: string[], log: ReturnType<typeof createSenderLog>) => {
@@ -1358,7 +1381,7 @@ describe("stage 1 (--apply --no-email) followed by stage 2, on orders_export_1.c
     });
 
     it("order #1425, refunded and missing-email customers never had a workspace, so stage 2 can never email them", async () => {
-        const { rows, nameByEmail } = await runStageOne();
+        const { rows, nameByEmail, purchaseByEmail } = await runStageOne();
         const owners = new Set(rows.map((workspace) => workspace.owner_email));
         assert.equal(owners.has("munthaliw101@gmail.com"), false);
         assert.equal(owners.has("zdingez@gmail.com"), false);
@@ -1366,7 +1389,7 @@ describe("stage 1 (--apply --no-email) followed by stage 2, on orders_export_1.c
         // A stray legacy workspace for a held customer would still be skipped: the CSV plan knows them,
         // but a customer unknown to the CSV is never emailed.
         const stray = row("stray", "unknown@nowhere.example");
-        const plan = planEmailRun([...rows, stray], { nameByEmail, now: new Date("2026-11-10T00:00:00.000Z") }, null);
+        const plan = planEmailRun([...rows, stray], { nameByEmail, purchaseByEmail, now: new Date("2026-11-10T00:00:00.000Z") }, null);
         assert.equal(plan.pending.length, 39);
         assert.equal(plan.skipped[0]?.reason, "not_in_csv_plan");
     });
@@ -1540,6 +1563,7 @@ function stageTwoRows(store: StageOneStore): MigratedWorkspaceRow[] {
         expires_at: workspace.expires_at,
         notes: workspace.notes,
         billing_source: workspace.billing_source,
+        seat_limit: workspace.seat_limit,
         owner_member_status: store.members.find((member) => member.workspaceId === workspace.id)?.status ?? null,
         user_status: null,
     }));
@@ -1751,7 +1775,11 @@ describe("stage 1 exact recipient targeting (--only-emails)", () => {
                 args: ["--send", "--only-emails=pilot.small@example.com"],
                 db: createLedgerDb(stageTwoRows(store).filter((workspace) => workspace.id === "ws-live")),
                 log: createSenderLog(),
-                context: { nameByEmail: new Map([["pilot.small@example.com", "Pilot Small"]]), now: new Date("2026-11-10T00:00:00.000Z") },
+                context: {
+                    nameByEmail: new Map([["pilot.small@example.com", "Pilot Small"]]),
+                    purchaseByEmail: buildPurchaseIndex(PILOT_PLAN.customers),
+                    now: new Date("2026-11-10T00:00:00.000Z"),
+                },
             }),
             /not_migration_workspace/
         );
@@ -2167,6 +2195,9 @@ describe("stage 2 exact recipient targeting (--only-emails)", () => {
         const message = buildFreeYearMessage(request, "from@test.invalid", log.sent[0]!.headers);
         const approved = getLegacyFreeYearEmailContent({
             customerName: request.customerName,
+            accountEmail: request.accountEmail,
+            workspaceName: request.workspaceName,
+            purchase: request.purchase,
             startDate: request.startDate,
             expiryDate: request.expiryDate,
             androidUrl: FULL_CONFIG.androidUrl,
@@ -2202,7 +2233,11 @@ describe("stage 2 exact recipient targeting (--only-emails)", () => {
 
 describe("pilot rehearsal: stage 1 then stage 2 for exactly two customers", () => {
     const names = new Map(PILOT_PLAN.customers.filter((customer) => customer.email).map((customer) => [customer.email, customer.customerName]));
-    const context: ClassifyContext = { nameByEmail: names, now: new Date("2026-11-10T00:00:00.000Z") };
+    const context: ClassifyContext = {
+        nameByEmail: names,
+        purchaseByEmail: buildPurchaseIndex(PILOT_PLAN.customers),
+        now: new Date("2026-11-10T00:00:00.000Z"),
+    };
 
     it("migrates and emails the two listed customers once each, and nobody else, ever", async () => {
         const store = createStageOneStore();
@@ -2380,6 +2415,9 @@ describe("sample email mode (--sample): content and delivery", () => {
         const content = renderSampleEmail(FULL_CONFIG);
         const approved = getLegacyFreeYearEmailContent({
             customerName: SAMPLE_CUSTOMER_NAME,
+            accountEmail: SAMPLE_ACCOUNT_EMAIL,
+            workspaceName: SAMPLE_WORKSPACE_NAME,
+            purchase: buildSamplePurchase("large"),
             startDate: SAMPLE_START_DATE,
             expiryDate: SAMPLE_EXPIRY_DATE,
             androidUrl: FULL_CONFIG.androidUrl,
@@ -2396,7 +2434,9 @@ describe("sample email mode (--sample): content and delivery", () => {
         assert.match(content.text, /^Hi HealthAge Test Customer,/);
         assert.match(content.text, /Start Date: 2026-01-01 \(sample date\)/);
         assert.match(content.text, /Expires: 2027-01-01 \(sample date\)/);
-        assert.match(content.html, /Start Date: 2026-01-01 \(sample date\)<br>/);
+        // In the HTML the label and the value sit in separate table cells.
+        assert.match(content.html, />Start Date<\/td>/);
+        assert.match(content.html, />2026-01-01 \(sample date\)<\/td>/);
         assert.match(SAMPLE_START_DATE + SAMPLE_EXPIRY_DATE, /sample date.*sample date/);
     });
 
@@ -2958,6 +2998,206 @@ describe("sample email mode (--sample): the real CLI against loopback traps", ()
             assert.equal(db.attempts(), 0);
             assert.deepEqual(readdirSync(cwd), []);
         });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Personalised onboarding email: what each customer is told, and the protections around it
+// ---------------------------------------------------------------------------
+
+describe("stage 2 sends each customer the email for what they actually bought", () => {
+    const LATER = new Date("2026-11-10T00:00:00.000Z");
+    const contextFor = (): ClassifyContext => ({
+        nameByEmail: new Map(PILOT_PLAN.customers.filter((c) => c.email).map((c) => [c.email, c.customerName])),
+        purchaseByEmail: buildPurchaseIndex(PILOT_PLAN.customers),
+        now: LATER,
+    });
+
+    it("end to end: every customer's email states the license count the migration wrote, in words that fit their product", async () => {
+        const store = createStageOneStore();
+        await runStageOneWith({ store, args: ["--apply", "--no-email"] });
+        const db = createLedgerDb(stageTwoRows(store));
+        const log = createSenderLog();
+        const run = await runStage({ args: ["--send", "--all"], db, log, context: contextFor() });
+        assert.equal(emailRunExitCode(run.outcomes), 0);
+
+        const expected: Record<string, RegExp> = {
+            "pilot.large@example.com": /Your Large Venue Kit includes 4 licenses\./,
+            "pilot.small@example.com": /Your Small Venue Kit includes 1 license\./,
+            "pilot.large+extra@example.com": /Your Discover Your Health Age purchase includes 3 licenses\./,
+            "other.large@example.com": /Your 2 Large Venue Kits include 8 licenses\./,
+            "other.dyha@example.com": /Your Discover Your Health Age purchase includes 2 licenses\./,
+        };
+        assert.deepEqual([...log.recipients()].sort(), Object.keys(expected).sort());
+
+        for (const entry of log.sent) {
+            const email = entry.request.to;
+            const workspace = store.workspaces.find((candidate) => candidate.owner_email === email)!;
+            const plan = PILOT_PLAN.customers.find((customer) => customer.email === email)!;
+            const message = buildFreeYearMessage(entry.request, "from@test.invalid", entry.headers);
+
+            // One number, three sources, all equal: the email, the workspace, the plan.
+            assert.equal(entry.request.purchase.licenses, workspace.seat_limit, `${email}: email vs workspace`);
+            assert.equal(entry.request.purchase.licenses, plan.licenseQuantity, `${email}: email vs plan`);
+            assert.ok(message.text.includes(`“1 of ${workspace.seat_limit} ${workspace.seat_limit === 1 ? "license" : "licenses"} used”`), email);
+            assert.match(message.text, expected[email]!, email);
+            assert.ok(message.text.includes(`Your workspace is called “${workspace.name}”`), email);
+            assert.ok(message.text.includes(`Use exactly “${email}”`), email);
+            assert.ok(message.html.includes(`href="${FULL_CONFIG.iosUrl}"`));
+            assert.doesNotMatch(message.text + message.html, /sample date|HealthAge Test Customer|test\.customer@example\.com/i);
+
+            // Members are only mentioned for customers who have licenses to give.
+            const extra = workspace.seat_limit - 1;
+            assert.equal(/Invite a Member/.test(message.text), extra > 0, `${email}: member steps iff more than 1 license`);
+        }
+    });
+
+    it("a workspace holding a different number of licenses than the plan allocates is held back, never emailed with the wrong count", async () => {
+        const db = createLedgerDb([row("ws-ann", "ann@example.com", { seat_limit: 3 })]); // CONTEXT's plan says 1
+        const plan = planEmailRun(db.rows(), CONTEXT, null);
+        assert.deepEqual(plan.skipped.map((entry) => entry.reason), ["license_mismatch"]);
+        assert.match(plan.skipped[0]!.detail, /holds 3 license\(s\) but the plan allocates 1/);
+
+        const log = createSenderLog();
+        const live = await runStage({ args: ["--send", "--all"], db, log });
+        assert.deepEqual(live.outcomes, []);
+        assert.deepEqual(log.attempts, []);
+        await assert.rejects(runStage({ args: ["--send", "--only-emails=ann@example.com"], db, log }), /license_mismatch/);
+        assert.deepEqual(log.attempts, []);
+    });
+
+    it("re-checks the license count under the lock: seats changed after the plan was made, so nothing is sent", async () => {
+        const planDb = createLedgerDb([row("ws-ann", "ann@example.com")]);
+        const runDb = createLedgerDb([row("ws-ann", "ann@example.com", { seat_limit: 5 })]); // an admin raised the seats meanwhile
+        const mode = resolveSendMode(parseSendEmailsArgs(["--send", "--all"]));
+        const runPlan = planEmailRun(planDb.rows(), CONTEXT, mode.limit);
+        assert.equal(runPlan.selected.length, 1);
+        const log = createSenderLog();
+        const outcomes = await runEmailStage({
+            mode,
+            selected: runPlan.selected,
+            emailConfig: FULL_CONFIG,
+            sender: createGuardedSender({ mode, liveRecipients: new Set(["ann@example.com"]), rawSender: log.raw }),
+            ledger: runDb.runner,
+            context: CONTEXT,
+            now: () => NOW,
+        });
+        assert.deepEqual([outcomes[0]?.status, outcomes[0]?.reason], ["skipped", "license_mismatch"]);
+        assert.deepEqual(log.attempts, []);
+        assert.equal(runDb.ledgerWrites(), 0);
+    });
+
+    it("a customer the plan has no qualifying purchase for cannot be emailed, because the email could not say what they bought", () => {
+        const withoutAnn = { ...CONTEXT, purchaseByEmail: new Map([...PURCHASES].filter(([email]) => email !== "ann@example.com")) };
+        const plan = planEmailRun([row("ws-ann", "ann@example.com"), row("ws-bob", "bob@example.com")], withoutAnn, null);
+        assert.deepEqual(plan.pending.map((candidate) => candidate.email), ["bob@example.com"]);
+        assert.deepEqual(plan.skipped.map((entry) => [entry.workspace.owner_email, entry.reason]), [["ann@example.com", "no_qualifying_purchase"]]);
+    });
+
+    it("in a test send the email still describes the CUSTOMER (their address, workspace, licenses), never the tester", async () => {
+        const db = createLedgerDb([row("ws-ann", "ann@example.com", { name: "Archer Clinic" })]);
+        const log = createSenderLog();
+        await runStage({ args: ["--test-recipients=qa@test.example"], db, log });
+        const request = log.sent[0]!.request;
+        assert.equal(request.to, "qa@test.example");
+        assert.equal(request.accountEmail, "ann@example.com");
+        assert.equal(request.workspaceName, "Archer Clinic");
+        const message = buildFreeYearMessage(request, "from@test.invalid", log.sent[0]!.headers);
+        assert.ok(message.text.includes("ann@example.com") && message.html.includes("ann@example.com"));
+        assert.ok(!message.text.includes("qa@test.example") && !message.html.includes("qa@test.example"));
+        assert.equal(db.ledgerWrites(), 0, "a test send still never touches the ledger");
+    });
+
+    it("the legacy stage 1 inline email carries the same personalisation (account, workspace, purchase)", async () => {
+        const store = createStageOneStore([]);
+        const customer = PILOT_PLAN.customers.find((candidate) => candidate.email === "pilot.large@example.com")!;
+        const decision = {
+            ...decideCustomer({ customer, runDate: PILOT_RUN_DATE, user: undefined, workspaces: [], dbChecked: true }),
+            inThisRun: true,
+        };
+        const payloads: Array<Parameters<Parameters<typeof applyOneCustomer>[0]["sendEmail"]>[0]> = [];
+        const result = await applyOneCustomer({
+            runner: store.runner,
+            notesWriter: { findWorkspacesByOwnerEmail: store.executor.findWorkspacesByOwnerEmail, updateWorkspaceNotes: async () => undefined },
+            customer,
+            decision,
+            writeMode: { writesEnabled: true, emailsEnabled: true },
+            emailConfig: FULL_CONFIG,
+            sendEmail: async (payload) => {
+                payloads.push(payload);
+            },
+            now: PILOT_RUN_DATE,
+        });
+        assert.equal(result.emailed, true);
+        const payload = payloads[0]!;
+        assert.equal(payload.accountEmail, "pilot.large@example.com");
+        assert.equal(payload.workspaceName, "Pilot Large");
+        assert.equal(payload.purchase.licenses, 4);
+        assert.equal(payload.purchase.licenses, store.workspaces[0]!.seat_limit);
+        assert.match(getLegacyFreeYearEmailContent(payload).text, /Your Large Venue Kit includes 4 licenses\./);
+    });
+});
+
+describe("the stage 2 CLI feeds the personalisation from real data", () => {
+    const cli = readFileSync(resolve(process.cwd(), "scripts/migrations/legacy-shopify-customers/send-emails.ts"), "utf8");
+
+    it("reads the license count and workspace name from the database, in the snapshot AND under the lock", () => {
+        const snapshot = cli.slice(cli.indexOf("const MIGRATED_WORKSPACES_SQL"), cli.indexOf("/** Every stage 1 workspace"));
+        assert.match(snapshot, /w\.name/);
+        assert.match(snapshot, /w\.seat_limit/);
+        const locked = cli.slice(cli.indexOf("async claimWorkspace"), cli.indexOf("async recordEmailSent"));
+        assert.match(locked, /SELECT id, name, owner_email, status, subscription_status, expires_at, notes, billing_source, seat_limit/);
+    });
+
+    it("builds the purchase index from the same CSV plan as the names, and hands it to the classifier", () => {
+        assert.match(cli, /purchaseByEmail: buildPurchaseIndex\(plan\.customers\)/);
+        assert.match(cli, /const context = \{ nameByEmail, purchaseByEmail/);
+    });
+});
+
+describe("sample mode shows each product's email (--sample-product)", () => {
+    const modeOf = (...args: string[]) => resolveSendMode(parseSendEmailsArgs(args));
+    const seatsPerUnit = (ruleId: string): number => {
+        const rule = ELIGIBLE_PRODUCTS.find((candidate) => candidate.id === ruleId);
+        assert.ok(rule && rule.licenseQuantity.type === "fixed_per_unit", `${ruleId} is a fixed-per-unit product`);
+        return rule.licenseQuantity.seatsPerUnit;
+    };
+
+    it("defaults to the Large Venue Kit, and each choice shows that product with the migration's own license count", () => {
+        assert.equal(modeOf("--sample", `--test-recipients=${SAMPLE_ONE}`).sampleProduct, "large");
+        const expected = { small: /Your Small Venue Kit includes 1 license\./, large: /Your Large Venue Kit includes 4 licenses\./, dyha: /Your Discover Your Health Age purchase includes 3 licenses\./ };
+        for (const product of ["small", "large", "dyha"] as const) {
+            const mode = modeOf("--sample", `--sample-product=${product}`, `--test-recipients=${SAMPLE_ONE}`);
+            assert.equal(mode.sampleProduct, product);
+            const content = renderSampleEmail(FULL_CONFIG, product);
+            assert.match(content.text, expected[product]);
+            // Kit samples use the real per-unit license counts from the product rules; the DYHA sample is "- 3".
+            const expectedLicenses = product === "dyha" ? 3 : seatsPerUnit(`health_expo_screening_kit_${product}`);
+            assert.equal(buildSamplePurchase(product).licenses, expectedLicenses);
+            assert.match(content.text, /sample date/);
+            assert.ok(content.text.includes(SAMPLE_ACCOUNT_EMAIL) && content.text.includes(SAMPLE_WORKSPACE_NAME));
+        }
+    });
+
+    it("rejects an unknown product, a repeated flag, and use without --sample", () => {
+        assert.throws(() => modeOf("--sample", "--sample-product=huge", `--test-recipients=${SAMPLE_ONE}`), /Invalid --sample-product value "huge"/);
+        assert.throws(() => modeOf("--sample", "--sample-product=small", "--sample-product=large", `--test-recipients=${SAMPLE_ONE}`), /more than once/);
+        assert.throws(() => modeOf("--sample-product=small", `--test-recipients=${SAMPLE_ONE}`), /requires --sample/);
+        assert.throws(() => modeOf("--send", "--all", "--sample-product=small"), /requires --sample/);
+        // It changes nothing about safety: still preview by default, still no customers.
+        const mode = modeOf("--sample", "--sample-product=dyha", `--test-recipients=${SAMPLE_ONE}`);
+        assert.deepEqual([mode.target, mode.sends, mode.onlyEmails], ["sample", false, []]);
+    });
+
+    it("a delivered sample of the chosen product goes only to the listed address", async () => {
+        for (const product of ["small", "dyha"] as const) {
+            const mode = modeOf("--sample", "--send-sample", `--sample-product=${product}`, `--test-recipients=${SAMPLE_ONE}`);
+            const log = createSenderLog();
+            await runSampleStage({ mode, emailConfig: FULL_CONFIG, sender: createGuardedSender({ mode, liveRecipients: new Set(), rawSender: log.raw }) });
+            assert.deepEqual(log.attempts, [SAMPLE_ONE]);
+            assert.deepEqual(log.sent[0]!.request.purchase, buildSamplePurchase(product));
+            assert.equal(log.sent[0]!.headers?.[TEST_MODE_HEADER], "sample");
+        }
     });
 });
 

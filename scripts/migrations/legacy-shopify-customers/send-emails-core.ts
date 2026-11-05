@@ -37,14 +37,26 @@ import {
 } from "./apply-core";
 import { formatGrantDisplayDate, isUsableEmail, normalizeEmail } from "./build-plan";
 import type { FreeYearEmailRequest } from "./email-transport";
-import { getLegacyFreeYearEmailContent, inferMigrationCustomerDisplayName, type FreeYearEmailContent } from "./migration-email";
-import { GRANT_CONFIG } from "./product-eligibility";
+import {
+    getLegacyFreeYearEmailContent,
+    inferMigrationCustomerDisplayName,
+    type FreeYearEmailContent,
+    type PurchaseSummary,
+} from "./migration-email";
+import { ELIGIBLE_PRODUCTS, GRANT_CONFIG } from "./product-eligibility";
+import { purchaseLine } from "./purchase-summary";
 
 /** Header added to test messages. The subject and body stay exactly as approved. */
 export const TEST_MODE_HEADER = "X-HealthAge-Migration-Email-Mode";
 
 /** A test run sends for one customer unless told otherwise. */
 export const DEFAULT_TEST_LIMIT = 1;
+
+/** Which product's email a `--sample` run shows. */
+export const SAMPLE_PRODUCTS = ["small", "large", "dyha"] as const;
+export type SampleProduct = (typeof SAMPLE_PRODUCTS)[number];
+/** The richest variant (owner + invited members), so the default sample shows every section. */
+export const DEFAULT_SAMPLE_PRODUCT: SampleProduct = "large";
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -66,13 +78,15 @@ export type SendEmailsArgs = {
     readonly sample: boolean;
     /** Actually deliver the sample email (to `testRecipients` only). Needs `sample`. */
     readonly sendSample: boolean;
+    /** Which product the sample email describes (`--sample-product=`); null = not given. Needs `sample`. */
+    readonly sampleProduct: SampleProduct | null;
     /** Whether `--csv=` / `--out=` were given explicitly (sample mode must reject them, not ignore them). */
     readonly csvExplicit: boolean;
     readonly outExplicit: boolean;
 };
 
 const SUPPORTED_FLAGS =
-    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --sample, --send-sample, --allow-missing-platform-links, --csv=, --out=";
+    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --sample, --send-sample, --sample-product=small|large|dyha, --allow-missing-platform-links, --csv=, --out=";
 
 /**
  * Unrecognised arguments are rejected, never ignored. In particular the stage 1
@@ -91,6 +105,7 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
     let allowMissingPlatformLinks = false;
     let sample = false;
     let sendSample = false;
+    let sampleProduct: SampleProduct | null = null;
     let csvExplicit = false;
     let outExplicit = false;
 
@@ -118,6 +133,13 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
         } else if (argument.startsWith("--test-recipients=")) {
             if (testRecipients !== null) throw new Error("--test-recipients was given more than once");
             testRecipients = parseTestRecipients(argument.slice("--test-recipients=".length));
+        } else if (argument.startsWith("--sample-product=")) {
+            if (sampleProduct !== null) throw new Error("--sample-product was given more than once");
+            const value = argument.slice("--sample-product=".length).trim().toLowerCase();
+            if (!(SAMPLE_PRODUCTS as readonly string[]).includes(value)) {
+                throw new Error(`Invalid --sample-product value "${value}". Use one of: ${SAMPLE_PRODUCTS.join(", ")}.`);
+            }
+            sampleProduct = value as SampleProduct;
         } else if (argument.startsWith("--only-emails=")) {
             if (onlyEmails !== null) throw new Error("--only-emails was given more than once");
             onlyEmails = parseEmailAllowlist("--only-emails", argument.slice("--only-emails=".length));
@@ -138,6 +160,7 @@ export function parseSendEmailsArgs(argv: readonly string[]): SendEmailsArgs {
         allowMissingPlatformLinks,
         sample,
         sendSample,
+        sampleProduct,
         csvExplicit,
         outExplicit,
     };
@@ -173,6 +196,8 @@ export type SendMode = {
      * addresses can be selected and only these can be sent to.
      */
     readonly onlyEmails: readonly string[];
+    /** Sample mode only: which product the synthetic email describes. Null in every other mode. */
+    readonly sampleProduct: SampleProduct | null;
     /** Customers processed this run. Null for `--all` and for an `--only-emails` run (the list is the scope). */
     readonly limit: number | null;
     readonly allowMissingPlatformLinks: boolean;
@@ -186,6 +211,7 @@ export type SendMode = {
 export function resolveSendMode(args: SendEmailsArgs): SendMode {
     // Sample mode is decided first and on its own: it never shares a code path with live sending.
     if (args.sample || args.sendSample) return resolveSampleMode(args);
+    if (args.sampleProduct) throw new Error("--sample-product requires --sample: it only chooses which synthetic email the sample shows.");
 
     const isTest = args.testRecipients.length > 0;
     const isTargeted = args.onlyEmails.length > 0;
@@ -220,6 +246,7 @@ export function resolveSendMode(args: SendEmailsArgs): SendMode {
             sends: !args.dryRun,
             testRecipients: args.testRecipients,
             onlyEmails: [],
+            sampleProduct: null,
             limit: args.limit ?? DEFAULT_TEST_LIMIT,
             allowMissingPlatformLinks: args.allowMissingPlatformLinks,
         };
@@ -239,6 +266,7 @@ export function resolveSendMode(args: SendEmailsArgs): SendMode {
         sends,
         testRecipients: [],
         onlyEmails: args.onlyEmails,
+        sampleProduct: null,
         limit: args.all ? null : args.limit,
         allowMissingPlatformLinks: args.allowMissingPlatformLinks,
     };
@@ -277,6 +305,7 @@ function resolveSampleMode(args: SendEmailsArgs): SendMode {
         sends: args.sendSample && !args.dryRun,
         testRecipients: args.testRecipients,
         onlyEmails: [],
+        sampleProduct: args.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT,
         limit: null,
         allowMissingPlatformLinks: false,
     };
@@ -313,6 +342,8 @@ export type MigratedWorkspaceRow = {
     readonly expires_at: Date | null;
     readonly notes: string | null;
     readonly billing_source: string;
+    /** Licenses stage 1 allocated to the workspace. The email states this number, so it must match the plan. */
+    readonly seat_limit: number;
     /** Status of the owner's membership row; null when no owner membership exists. */
     readonly owner_member_status: string | null;
     /** Status of the owner's user account; null when they have not registered yet. */
@@ -328,6 +359,8 @@ export const SKIP_REASONS = [
     "owner_membership_inactive",
     "account_disabled",
     "not_in_csv_plan",
+    "no_qualifying_purchase",
+    "license_mismatch",
     "workspace_missing",
 ] as const;
 
@@ -339,6 +372,8 @@ export type EmailCandidate = {
     readonly email: string;
     /** Greeting name, inferred from the customer's own address when the CSV has no name. */
     readonly displayName: string;
+    /** What they bought and how many licenses it is worth, from the same plan stage 1 used. */
+    readonly purchase: PurchaseSummary;
     /** First day of the grant: the expiry minus the grant length. */
     readonly startDate: string;
     readonly expiryDate: string;
@@ -351,14 +386,18 @@ export type Classification =
 export type ClassifyContext = {
     /** Billing name per normalized email, from the same CSV plan stage 1 used. */
     readonly nameByEmail: ReadonlyMap<string, string>;
+    /** What each customer bought and the licenses it is worth, from the same plan (`buildPurchaseIndex`). */
+    readonly purchaseByEmail: ReadonlyMap<string, PurchaseSummary>;
     readonly now: Date;
 };
 
 /**
  * Decides whether one migrated workspace is owed the email. A workspace is owed
  * it only if it is a stage 1 workspace, the ledger has no entry for it, it still
- * grants access, its owner can still be reached, and the CSV plan can say who
- * the customer is (the greeting name is not stored in the database).
+ * grants access, its owner can still be reached, the CSV plan can say who the
+ * customer is (the greeting name is not stored in the database) and what they
+ * bought, and the workspace really holds the number of licenses the plan allocates
+ * (the email states that number, so a mismatch is held for a human, never emailed).
  */
 export function classifyWorkspace(workspace: MigratedWorkspaceRow, context: ClassifyContext): Classification {
     const skip = (reason: SkipReason, detail: string): Classification => ({ kind: "skip", workspace, reason, detail });
@@ -392,6 +431,16 @@ export function classifyWorkspace(workspace: MigratedWorkspaceRow, context: Clas
     if (!context.nameByEmail.has(email)) {
         return skip("not_in_csv_plan", "the owner is not in the CSV plan, so the greeting name is unknown (wrong CSV?)");
     }
+    const purchase = context.purchaseByEmail.get(email);
+    if (!purchase) {
+        return skip("no_qualifying_purchase", "the CSV plan has no qualifying purchase for this owner, so the email cannot say what they bought");
+    }
+    if (workspace.seat_limit !== purchase.licenses) {
+        return skip(
+            "license_mismatch",
+            `the workspace holds ${workspace.seat_limit} license(s) but the plan allocates ${purchase.licenses}; the email would state the wrong number`
+        );
+    }
 
     const start = new Date(workspace.expires_at.getTime());
     start.setUTCDate(start.getUTCDate() - GRANT_CONFIG.accessDurationDays);
@@ -402,6 +451,7 @@ export function classifyWorkspace(workspace: MigratedWorkspaceRow, context: Clas
             workspace,
             email,
             displayName: inferMigrationCustomerDisplayName(email, context.nameByEmail.get(email)),
+            purchase,
             startDate: formatGrantDisplayDate(start),
             expiryDate: formatGrantDisplayDate(workspace.expires_at),
         },
@@ -604,7 +654,7 @@ export type LedgerTransaction = {
 
 export type LockedWorkspaceRow = Pick<
     MigratedWorkspaceRow,
-    "id" | "owner_email" | "status" | "subscription_status" | "expires_at" | "notes" | "billing_source"
+    "id" | "name" | "owner_email" | "status" | "subscription_status" | "expires_at" | "notes" | "billing_source" | "seat_limit"
 >;
 
 export type LedgerRunner = {
@@ -639,6 +689,10 @@ function requestFor(candidate: EmailCandidate, to: string, config: EmailConfig):
     return {
         to,
         customerName: candidate.displayName,
+        // The purchaser's sign-in address and workspace: always the CUSTOMER's, even when `to` is a tester.
+        accountEmail: candidate.email,
+        workspaceName: candidate.workspace.name,
+        purchase: candidate.purchase,
         startDate: candidate.startDate,
         expiryDate: candidate.expiryDate,
         androidUrl: config.androidUrl,
@@ -853,10 +907,44 @@ export function sampleSendBlockers(config: EmailConfig): string[] {
     return blockers;
 }
 
-export function buildSampleRequest(to: string, config: EmailConfig): FreeYearEmailRequest {
+/** The address a sample email tells the (fictional) purchaser to register with. Reserved, undeliverable domain. */
+export const SAMPLE_ACCOUNT_EMAIL = "test.customer@example.com";
+export const SAMPLE_WORKSPACE_NAME = "HealthAge Test Workspace";
+
+/**
+ * A synthetic purchase for the chosen product. The per-unit license counts come from the real
+ * product rules (`ELIGIBLE_PRODUCTS`), not from numbers repeated here, so a sample can never
+ * show a count the migration would not produce.
+ */
+export function buildSamplePurchase(product: SampleProduct): PurchaseSummary {
+    const kit = (ruleId: string) => {
+        const rule = ELIGIBLE_PRODUCTS.find((candidate) => candidate.id === ruleId);
+        if (!rule || rule.licenseQuantity.type !== "fixed_per_unit") {
+            throw new Error(`Sample email: product rule "${ruleId}" is missing or not a fixed-per-unit product.`);
+        }
+        const line = purchaseLine(ruleId, 1, rule.licenseQuantity.seatsPerUnit);
+        return { licenses: line.licenses, lines: [line] };
+    };
+    switch (product) {
+        case "small":
+            return kit("health_expo_screening_kit_small");
+        case "large":
+            return kit("health_expo_screening_kit_large");
+        case "dyha": {
+            // "Discover Your Health Age - 3": a 3-license software purchase.
+            const line = purchaseLine("discover_your_health_age", 1, 3);
+            return { licenses: line.licenses, lines: [line] };
+        }
+    }
+}
+
+export function buildSampleRequest(to: string, config: EmailConfig, product: SampleProduct = DEFAULT_SAMPLE_PRODUCT): FreeYearEmailRequest {
     return {
         to,
         customerName: SAMPLE_CUSTOMER_NAME,
+        accountEmail: SAMPLE_ACCOUNT_EMAIL,
+        workspaceName: SAMPLE_WORKSPACE_NAME,
+        purchase: buildSamplePurchase(product),
         startDate: SAMPLE_START_DATE,
         expiryDate: SAMPLE_EXPIRY_DATE,
         androidUrl: config.androidUrl,
@@ -868,10 +956,13 @@ export function buildSampleRequest(to: string, config: EmailConfig): FreeYearEma
 }
 
 /** The approved subject and body with the sample values, for the preview. Same template as a real send. */
-export function renderSampleEmail(config: EmailConfig): FreeYearEmailContent {
-    const request = buildSampleRequest("preview@sample.invalid", config);
+export function renderSampleEmail(config: EmailConfig, product: SampleProduct = DEFAULT_SAMPLE_PRODUCT): FreeYearEmailContent {
+    const request = buildSampleRequest("preview@sample.invalid", config, product);
     return getLegacyFreeYearEmailContent({
         customerName: request.customerName,
+        accountEmail: request.accountEmail,
+        workspaceName: request.workspaceName,
+        purchase: request.purchase,
         startDate: request.startDate,
         expiryDate: request.expiryDate,
         androidUrl: request.androidUrl,
@@ -917,7 +1008,7 @@ export async function runSampleStage(input: {
             continue;
         }
         try {
-            await input.sender(buildSampleRequest(to, input.emailConfig));
+            await input.sender(buildSampleRequest(to, input.emailConfig, mode.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT));
             outcomes.push({ to, status: "sent", error: null });
         } catch (error) {
             outcomes.push({ to, status: "failed", error: messageOf(error) });

@@ -5,6 +5,8 @@
  * share this module so a dry-run report is the same plan the writer would execute.
  */
 
+import { isSafeHttpUrl, type PurchaseSummary } from "./migration-email";
+import { buildPurchaseSummary } from "./purchase-summary";
 import { APPLY_SCOPE, GRANT_CONFIG } from "./product-eligibility";
 import {
     formatGrantDisplayDate,
@@ -279,6 +281,16 @@ export function emailConfigIssues(config: EmailConfig): readonly string[] {
         issues.push("No HealthAge store URL is configured");
     }
     if (!config.supportEmail) issues.push("HEALTHAGE_SUPPORT_EMAIL is not set");
+    // A configured link becomes a button in a customer's inbox, so it must be a plain http(s) URL.
+    const links: ReadonlyArray<readonly [string, string | null]> = [
+        ["HEALTHAGE_ANDROID_URL", config.androidUrl],
+        ["HEALTHAGE_WINDOWS_URL", config.windowsUrl],
+        ["HEALTHAGE_IOS_URL", config.iosUrl],
+        ["HEALTHAGE_MACOS_URL", config.macosUrl],
+    ];
+    for (const [name, url] of links) {
+        if (url && !isSafeHttpUrl(url)) issues.push(`${name} is not a plain http(s) URL`);
+    }
     return issues;
 }
 
@@ -575,6 +587,11 @@ export async function applyOneCustomer(input: {
     sendEmail: (payload: {
         to: string;
         customerName: string;
+        /** The address the purchaser registers and signs in with. */
+        accountEmail: string;
+        workspaceName: string;
+        /** What was bought and how many licenses it is worth, from the plan. */
+        purchase: PurchaseSummary;
         startDate: string;
         expiryDate: string;
         androidUrl: string | null;
@@ -739,10 +756,27 @@ export async function applyOneCustomer(input: {
         };
     }
 
+    const purchase = buildPurchaseSummary(customer);
+    if (!purchase) {
+        return {
+            email: customer.email,
+            action: "CREATE",
+            wrote: true,
+            workspaceId,
+            membershipStatus,
+            emailed: false,
+            emailError: "No qualifying purchase to describe in the email",
+            error: null,
+        };
+    }
+
     try {
         await input.sendEmail({
             to: customer.email,
             customerName: customer.customerName,
+            accountEmail: customer.email,
+            workspaceName: resolveWorkspaceName(customer),
+            purchase,
             startDate: decision.startDate,
             expiryDate: decision.expiryDate,
             androidUrl: emailConfig.androidUrl,

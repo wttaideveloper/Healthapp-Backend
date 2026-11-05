@@ -32,7 +32,7 @@ import {
     type ExistingWorkspace,
     type TransactionRunner,
 } from "./apply-core.ts";
-import { configuredStoreLinks, getLegacyFreeYearEmailContent } from "./migration-email.ts";
+import { configuredStoreLinks, getLegacyFreeYearEmailContent, type PurchaseSummary } from "./migration-email.ts";
 
 const PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.wtt.healthAge";
 const MICROSOFT_STORE_URL = "https://apps.microsoft.com/detail/9P8MFP2CBVL5";
@@ -797,9 +797,20 @@ describe("legacy Shopify apply decisions", () => {
     });
 });
 
+/** What the onboarding email needs besides the store links: who signs in, which workspace, what was bought. */
+const ONBOARDING = {
+    accountEmail: "pat@example.com",
+    workspaceName: "Pat Workspace",
+    purchase: {
+        licenses: 1,
+        lines: [{ kind: "dyha", label: "Discover Your Health Age", units: 1, licenses: 1 }],
+    } satisfies PurchaseSummary,
+} as const;
+
 describe("legacy free-year email", () => {
     it("does not reuse live Shopify owner-welcome copy", () => {
         const content = getLegacyFreeYearEmailContent({
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-08-16",
             expiryDate: "2027-08-16",
@@ -812,18 +823,20 @@ describe("legacy free-year email", () => {
         assert.doesNotMatch(content.text, /workspace-admin/);
         assert.doesNotMatch(content.subject, /Workspace Admin/);
 
-        // The live owner-welcome email links to the Workspace Admin portal. The free-year email
-        // is a different message and carries no admin link, whichever address that link uses.
-        // (The retired address contained "workspace-admin"; the current one does not, so the
-        // portal host must be checked explicitly to keep detecting reuse of that copy.)
+        // The onboarding email now DELIBERATELY links to the Admin Portal (current address only).
+        // What must never come back is the live owner-welcome copy and its retired address.
         for (const body of [content.text, content.html]) {
-            assert.doesNotMatch(body, /healthage\.healthexporesources\.com/);
+            assert.match(body, /https:\/\/healthage\.healthexporesources\.com\//);
             assert.doesNotMatch(body, /Visit:/);
+            assert.doesNotMatch(body, /Pro account|Your Pro access will automatically/);
+            assert.doesNotMatch(body, /vercel\.app/);
         }
+        assert.doesNotMatch(content.subject, /Added as Workspace Admin|Complete registration/);
     });
 
     it("includes Android and Windows store links when configured", () => {
         const content = getLegacyFreeYearEmailContent({
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-08-16",
             expiryDate: "2027-08-16",
@@ -831,16 +844,18 @@ describe("legacy free-year email", () => {
             windowsUrl: MICROSOFT_STORE_URL,
             supportEmail: SUPPORT_EMAIL,
         });
-        assert.match(content.text, /Get started here:/);
-        assert.match(content.text, /Android:\nhttps:\/\/play\.google\.com\/store\/apps\/details\?id=com\.wtt\.healthAge/);
-        assert.match(content.text, /Windows:\nhttps:\/\/apps\.microsoft\.com\/detail\/9P8MFP2CBVL5/);
+        assert.match(content.text, /Android: https:\/\/play\.google\.com\/store\/apps\/details\?id=com\.wtt\.healthAge/);
+        assert.match(content.text, /Windows: https:\/\/apps\.microsoft\.com\/detail\/9P8MFP2CBVL5/);
         assert.match(content.html, /play\.google\.com\/store\/apps\/details\?id=com\.wtt\.healthAge/);
         assert.match(content.html, /apps\.microsoft\.com\/detail\/9P8MFP2CBVL5/);
-        assert.match(content.text, /Now available on:\n\nAndroid • Windows/);
+        assert.match(content.text, /Available on: Android • Windows/);
+        assert.match(content.html, /Download for Android/);
+        assert.match(content.html, /Download for Windows/);
     });
 
     it("omits iOS and macOS links when those URLs are not configured", () => {
         const input = {
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-08-16",
             expiryDate: "2027-08-16",
@@ -861,10 +876,12 @@ describe("legacy free-year email", () => {
         assert.doesNotMatch(content.html, /macOS:/);
         assert.doesNotMatch(content.text, /apps\.apple\.com/);
         assert.doesNotMatch(content.html, /apps\.apple\.com/);
+        assert.doesNotMatch(content.html, /Download for (iOS|macOS)/);
     });
 
     it("includes iOS and macOS only when those URLs are configured", () => {
         const content = getLegacyFreeYearEmailContent({
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-08-16",
             expiryDate: "2027-08-16",
@@ -874,13 +891,16 @@ describe("legacy free-year email", () => {
             macosUrl: "https://apps.apple.com/example-macos",
             supportEmail: SUPPORT_EMAIL,
         });
-        assert.match(content.text, /iOS:\nhttps:\/\/apps\.apple\.com\/example-ios/);
-        assert.match(content.text, /macOS:\nhttps:\/\/apps\.apple\.com\/example-macos/);
+        assert.match(content.text, /iOS: https:\/\/apps\.apple\.com\/example-ios/);
+        assert.match(content.text, /macOS: https:\/\/apps\.apple\.com\/example-macos/);
         assert.match(content.text, /Android • Windows • iOS • macOS/);
+        assert.match(content.html, /Download for iOS/);
+        assert.match(content.html, /Download for macOS/);
     });
 
     it("uses the HealthAge support address and does not use the old Vercel app URL", () => {
         const content = getLegacyFreeYearEmailContent({
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-08-16",
             expiryDate: "2027-08-16",
@@ -1580,8 +1600,9 @@ describe("email safety", () => {
         });
     });
 
-    it("the approved free-year template is unchanged and not product-specific", () => {
+    it("the approved subject and sign-off are unchanged; dates are shown in full and the body is personalised", () => {
         const content = getLegacyFreeYearEmailContent({
+            ...ONBOARDING,
             customerName: "Pat",
             startDate: "2026-11-04",
             expiryDate: "2027-11-04",
@@ -1590,7 +1611,7 @@ describe("email safety", () => {
             supportEmail: SUPPORT_EMAIL,
         });
         assert.equal(content.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
-        assert.match(content.text, /Start Date: 2026-11-04\nExpires: 2027-11-04/);
+        assert.match(content.text, /Start Date: 4 November 2026\nExpires: 4 November 2027/);
         assert.match(content.text, /- Pastor Rodney Bowes$/);
         assert.doesNotMatch(content.text, /\biOS:|\bmacOS:/);
     });

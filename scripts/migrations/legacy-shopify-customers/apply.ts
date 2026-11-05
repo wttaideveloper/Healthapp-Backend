@@ -44,7 +44,7 @@ import {
     type TargetReport,
 } from "./apply-core";
 import { sendFreeYearEmail as sendViaSmtp } from "./email-transport";
-import { inferMigrationCustomerDisplayName } from "./migration-email";
+import { inferMigrationCustomerDisplayName, type PurchaseSummary } from "./migration-email";
 
 type DbSnapshot = {
     readonly usersByEmail: Map<string, ExistingUser>;
@@ -201,6 +201,9 @@ function createPgRunner(pool: Pool) {
 async function sendFreeYearEmail(input: {
     to: string;
     customerName: string;
+    accountEmail: string;
+    workspaceName: string;
+    purchase: PurchaseSummary;
     startDate: string;
     expiryDate: string;
     androidUrl: string | null;

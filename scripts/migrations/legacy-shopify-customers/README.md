@@ -144,15 +144,19 @@ pnpm migrate:legacy-shopify:send-emails "--test-recipients=you@yourdomain.com,co
 Test-email checklist:
 
 1. The subject is `Your 1 year of FREE access to the new Discover Your Health Age App`.
-2. The greeting is a customer's billing name (it is a real customer's content).
-3. `Start Date` is the stage 1 run date and `Expires` is 365 days later.
+2. The greeting is a customer's billing name (it is a real customer's content),
+   and the email names that customer's own sign-in address and workspace.
+3. The headline and "Your access" card state the license count the migration
+   wrote (compare with `workspaces.seat_limit`); `Start Date` is the stage 1 run
+   date and `Expires` is 365 days later, both shown in full ("4 November 2026").
 4. Android and Windows links open the right listings; **iOS and macOS links are
    present and correct** (they appear only when `HEALTHAGE_IOS_URL` /
    `HEALTHAGE_MACOS_URL` are set).
 5. The support address is correct.
 6. The message carries the header `X-HealthAge-Migration-Email-Mode: test`. The
-   subject and body are identical to what customers receive; only this header
-   distinguishes a test.
+   subject and body are exactly what that customer would receive; only this
+   header distinguishes a test. It still describes the CUSTOMER (their address,
+   workspace and licenses), never the tester.
 7. Re-run 2a: the pending count is unchanged.
 
 Test mode refuses to run if a test address belongs to any migrated owner or any
@@ -202,7 +206,10 @@ A migrated workspace is emailed only if **all** of these hold:
 - the owner's account, if any, is not deactivated;
 - the owner is in the CSV, which supplies the greeting name. The name is not
   stored in the database, so a workspace whose owner the CSV does not know is
-  skipped and reported rather than greeted by guesswork (usually the wrong CSV).
+  skipped and reported rather than greeted by guesswork (usually the wrong CSV);
+- the plan has a qualifying purchase for the owner (`no_qualifying_purchase`
+  otherwise) and the workspace's `seat_limit` equals the licenses the plan
+  allocates (`license_mismatch` otherwise), because the email states that number.
 
 Everything skipped is listed with its reason in the console and the report.
 Start date is the workspace expiry minus 365 days, i.e. the stage 1 run date.
@@ -240,10 +247,78 @@ Start date is the workspace expiry minus 365 days, i.e. the stage 1 run date.
 Reports are written to `migration-reports/` (git-ignored; they contain customer
 addresses).
 
+## The onboarding email
+
+Each customer gets one responsive HTML email (navy, white and subtle gold, inline
+CSS only, no scripts or external files) with a complete plain-text version. Both
+are built from one structured model, so they always say the same thing. It is
+personalised from what the migration actually did for that customer: billing
+name, the address they must sign in with, their workspace, what they bought, how
+many licenses that is, the real start and expiry dates, the Admin Portal address,
+the four store links and the support address. The subject is unchanged: *Your 1
+year of FREE access to the new Discover Your Health Age App*.
+
+**The license count is never recomputed by the email.** It comes from the plan's
+own calculation (the one the dry run prints, SKU and quantity included) and is
+cross-checked against the workspace: if the workspace holds a different number of
+licenses than the plan allocates, that customer is held back as `license_mismatch`
+and nobody is told a wrong number. A customer with no qualifying purchase in the
+plan is held back as `no_qualifying_purchase`.
+
+### The journey the email describes (verified against the application)
+
+| # | What the customer does | Where it is verified |
+| --- | --- | --- |
+| 1 | Opens the Admin Portal, which shows **Sign in** and "Need a workspace admin account? **Sign up**". | Portal `AdminAuthScreen.tsx` |
+| 2 | First time: **Sign up**, then *Full name* (letters, numbers, spaces, starting with a letter), *Work email*, *Password* (8+), then **Create account**. | Portal `WorkspaceAuthScreen.tsx`; `POST /api/v1/auth/register` |
+| 3 | The backend creates an **active** account and claims the invited owner seat for that exact email. The sign-up page still says the account "requires admin approval", but for a purchaser no approval is needed. | `auth.route.ts` (register and login both call `linkWorkspaceMembershipsForUser`) |
+| 4 | **Sign in.** The portal admits platform admins and *active* workspace owners/admins; anyone else sees "Account not authorized." (the email tells them to contact support). | Portal `page.tsx` `onLogin` |
+| 5 | Lands on **My Workspaces**. "Manage Organization Members" shows **"1 of N licenses used"**: the owner uses one. | Portal `MembersView.tsx`, `storage.ts` |
+| 6 | If N > 1: **Members**, then **Invite a Member** with *Email*, *Role* (leave **member**) and **Invite**. Active members and pending invitations both use a license. The backend emails the invitee. | `MembersView.tsx`; `POST /api/v1/workspaces/:id/members` (owner/admin only, seat check includes the owner) |
+| 7 | Each invited member uses the **app**, not the portal (the portal rejects plain members): **Create account** (or sign in) with the invited email. The license activates automatically; no checkout. | Mobile app `SignInScreen`, `SignUpScreen`, `i18n.ts` |
+| 8 | Downloads the app and signs in with the same email and password. | Mobile app `authService.ts` (no email-verification step exists) |
+
+A test reads the real Admin Portal, backend and mobile-app sources and fails if
+any quoted label or any of these behaviours disappears (the portal and app checks
+skip themselves when those projects are not checked out next to this one).
+
+### What differs by product
+
+| Purchase | Headline | Licenses | Steps | License box |
+| --- | --- | --- | --- | --- |
+| Small Venue Kit × 1 | "Your Small Venue Kit includes 1 license." | 1 | 7: no member steps | "One license, and it's yours" + "No additional member seats are included" |
+| Large Venue Kit × 1 | "Your Large Venue Kit includes 4 licenses." | 4 | 9: adds "Invite your additional members" and "What each additional member does" | "4 licenses: 1 for you and 3 for your team" |
+| Discover Your Health Age, N licenses | "Your Discover Your Health Age purchase includes N licenses." | N | 7 if N = 1, otherwise 9 | as above, with N − 1 invitations |
+| Several kits, or a mixed purchase | "Your 2 Large Venue Kits include 8 licenses." / "Your purchases include 11 licenses in total." | the real total | by total | every product is listed in "Your access" |
+
+Preview any variant (synthetic data, nothing sent, no database or CSV):
+
+```powershell
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=small "--test-recipients=you@yourdomain.com"
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=large "--test-recipients=you@yourdomain.com"
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=dyha  "--test-recipients=you@yourdomain.com"
+```
+
+### Known limits
+
+- **Mac App Store build.** In the mobile app, `mustUseAppStoreIapForPro()` is true
+  for Mac App Store (Mac Catalyst, IAP) builds, and there workspace access must
+  **not** unlock Pro. The direct-download macOS build (DMG, web Stripe flow) is
+  unaffected. Make sure the approved macOS link points at a build where workspace
+  access works.
+- The journey was verified by reading the code, not by running the portal. Watch
+  the first real customer's sign-up.
+- The backend's own member-invitation email still tells every invitee to visit
+  the Admin Portal first, although the portal only admits owners and admins. The
+  email described here sends members to the app instead. That backend email is
+  unchanged.
+
 ## Sample email (synthetic, test inboxes only)
 
 `--sample` shows, and with `--send-sample` delivers, the real migration email
 filled with **made-up data** to inboxes you name. It involves no customers.
+`--sample-product=small|large|dyha` chooses which product's email it shows
+(default `large`); the license counts come from the real product rules.
 
 ```powershell
 # Preview (the default): prints the email and sends nothing.
@@ -253,11 +328,13 @@ pnpm migrate:legacy-shopify:send-emails --sample "--test-recipients=you@yourdoma
 pnpm migrate:legacy-shopify:send-emails --sample --send-sample "--test-recipients=you@yourdomain.com,colleague@yourdomain.com"
 ```
 
-What the email contains: the approved subject and body, unchanged, addressed to
-`HealthAge Test Customer` with the dates `2026-01-01 (sample date)` and
+What the email contains: the same personalised onboarding email a customer gets
+(same subject, same template), addressed to `HealthAge Test Customer` for the
+fictional workspace `HealthAge Test Workspace` and the reserved address
+`test.customer@example.com`, with the dates `2026-01-01 (sample date)` and
 `2027-01-01 (sample date)`, the configured support address, and all four
 platform links. The message carries the header
-`X-HealthAge-Migration-Email-Mode: sample`; the subject and body are untouched.
+`X-HealthAge-Migration-Email-Mode: sample`.
 
 Safety rules (all enforced in code and covered by tests, including a test that
 runs the real CLI against a fake mail server and a fake database):
@@ -304,7 +381,8 @@ stages, and on nobody else. It exists for a controlled pilot with real customers
   the email ledger), and its sender refuses any address not on the list even if
   the plan were wrong.
 - Live sending still needs the approved iOS and macOS links in the environment
-  (`HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`); the email template is unchanged.
+  (`HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`); the email is the personalised
+  onboarding email described above.
 
 **Quote the flag in PowerShell.** An unquoted comma is an array operator, and
 through `pnpm` the list arrives as `a@x.com b@y.com` (rejected, so it fails
@@ -437,8 +515,8 @@ in the runbook above.
 ## Email configuration
 
 The free-year email is sent only after that customer's workspace/membership
-transaction commits. It is not sent in dry-run or with `--no-email`. The
-template is unchanged and is the same for every product.
+transaction commits. It is not sent in dry-run or with `--no-email`. Its content
+depends on the customer's product and license count (see "The onboarding email").
 
 Required before mail can be sent (do not invent placeholders):
 

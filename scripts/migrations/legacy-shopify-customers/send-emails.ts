@@ -35,8 +35,10 @@ import { emailConfigIssues, readEmailConfig, type EmailConfig } from "./apply-co
 import { buildMigrationPlan } from "./build-plan";
 import { readSmtpSettings, sendFreeYearEmail } from "./email-transport";
 import { readOrdersCsv, toCsvLine } from "./orders-csv";
+import { buildPurchaseIndex } from "./purchase-summary";
 import { APPLY_SCOPE, GRANT_CONFIG } from "./product-eligibility";
 import {
+    DEFAULT_SAMPLE_PRODUCT,
     SAMPLE_CUSTOMER_NAME,
     SAMPLE_EXPIRY_DATE,
     SAMPLE_START_DATE,
@@ -66,7 +68,7 @@ import {
 } from "./send-emails-core";
 
 const MIGRATED_WORKSPACES_SQL = `
-    SELECT w.id, w.name, w.owner_email, w.status, w.subscription_status, w.expires_at, w.notes, w.billing_source,
+    SELECT w.id, w.name, w.owner_email, w.status, w.subscription_status, w.expires_at, w.notes, w.billing_source, w.seat_limit,
            m.status AS owner_member_status,
            u.status::text AS user_status
     FROM workspaces w
@@ -110,7 +112,7 @@ function ledgerTransactionFor(client: PoolClient): LedgerTransaction {
             // app's own row locks (seat assignment, admin edits) while the SMTP call is in flight.
             await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`legacy-free-year-email:${workspaceId}`]);
             const result = await client.query<LockedWorkspaceRow>(
-                `SELECT id, owner_email, status, subscription_status, expires_at, notes, billing_source
+                `SELECT id, name, owner_email, status, subscription_status, expires_at, notes, billing_source, seat_limit
                  FROM workspaces WHERE id = $1`,
                 [workspaceId]
             );
@@ -343,7 +345,7 @@ function printSampleSummary(input: {
     outcomes: readonly SampleOutcome[];
 }): void {
     const { mode, emailConfig } = input;
-    const content = renderSampleEmail(emailConfig);
+    const content = renderSampleEmail(emailConfig, mode.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT);
     const link = (label: string, url: string | null) => console.log(`    ${label.padEnd(8)} ${url ?? "NOT SET"}`);
 
     console.log("");
@@ -358,6 +360,7 @@ function printSampleSummary(input: {
     console.log("             No customers, database, CSV, workspaces or email ledger are involved.");
     console.log("");
     console.log(`  Recipients (${mode.testRecipients.length}, exactly as given): ${mode.testRecipients.join(", ")}`);
+    console.log(`  Sample product  : ${mode.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT} (--sample-product=small|large|dyha)`);
     console.log(`  Sample customer : ${SAMPLE_CUSTOMER_NAME}`);
     console.log(`  Sample dates    : ${SAMPLE_START_DATE}  ->  ${SAMPLE_EXPIRY_DATE}`);
     console.log(`  Support address : ${emailConfig.supportEmail ?? "NOT SET"}`);
@@ -433,7 +436,9 @@ async function main(): Promise<void> {
             assertTestRecipientsAreNotCustomers(mode.testRecipients, [...rows.map((row) => row.owner_email), ...nameByEmail.keys()]);
         }
 
-        const context = { nameByEmail, now: runDate };
+        // Name and purchase come from the same CSV plan stage 1 used; the license count is cross-checked
+        // against the workspace itself, so the email can only state a number the workspace really holds.
+        const context = { nameByEmail, purchaseByEmail: buildPurchaseIndex(plan.customers), now: runDate };
         const runPlan = planEmailRun(rows, context, mode.limit, mode.onlyEmails);
         // A live exact-recipient run is refused outright, before any lock or SMTP call, unless every
         // listed address can be emailed or is already done. A preview just reports it.

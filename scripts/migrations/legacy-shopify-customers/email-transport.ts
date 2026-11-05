@@ -9,7 +9,7 @@
  * hand `createTransport` in.
  */
 
-import { getLegacyFreeYearEmailContent } from "./migration-email";
+import { getLegacyFreeYearEmailContent, type PurchaseSummary } from "./migration-email";
 
 export type FreeYearEmailRequest = {
     /** Where this message is delivered. In test mode this is a test address, never the customer. */
@@ -20,6 +20,14 @@ export type FreeYearEmailRequest = {
      * tester's mailbox name during a test send.
      */
     readonly customerName: string;
+    /**
+     * The address the PURCHASER registers and signs in with (the workspace owner email). Like the
+     * greeting name it describes the customer, never `to`: in a test send `to` is the tester.
+     */
+    readonly accountEmail: string;
+    readonly workspaceName: string;
+    /** What the customer bought and how many licenses it is worth: from the migration, never recomputed. */
+    readonly purchase: PurchaseSummary;
     readonly startDate: string;
     readonly expiryDate: string;
     readonly androidUrl: string | null;
@@ -87,6 +95,9 @@ export function buildFreeYearMessage(
 ): MailMessage {
     const content = getLegacyFreeYearEmailContent({
         customerName: request.customerName,
+        accountEmail: request.accountEmail,
+        workspaceName: request.workspaceName,
+        purchase: request.purchase,
         startDate: request.startDate,
         expiryDate: request.expiryDate,
         androidUrl: request.androidUrl,
