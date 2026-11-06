@@ -253,7 +253,12 @@ function buildModel(input: FreeYearEmailInput): Model {
             body: [
                 ["Back on the sign-in page, sign in with ", bold(account), " and your password."],
                 [
-                    "After you create the account the page may say it “requires admin approval”. For your purchase no extra approval step is needed: your workspace is already set up for this email address, so you should be able to sign in straight away. If you see “Account not authorized”, please contact us at ",
+                    "There is no approval step and nothing to wait for: as an eligible purchaser you can sign in as soon as your account is created. Your workspace is already linked to the email address used for your purchase, so always sign in with ",
+                    bold(account),
+                    ".",
+                ],
+                [
+                    "If you see “Account not authorized”, or your workspace does not appear after you sign in, please contact us at ",
                     support,
                     ".",
                 ],

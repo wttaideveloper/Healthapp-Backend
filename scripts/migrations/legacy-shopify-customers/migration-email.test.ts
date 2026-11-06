@@ -437,12 +437,27 @@ describe("onboarding email: the instructions do not invent anything", () => {
         }
     });
 
-    it("tells the owner to register with exactly the purchase address and to ask support if the portal says 'Account not authorized'", () => {
-        const { text } = render(largeKit(1));
+    it("tells the owner to register with exactly the purchase address, that no approval is needed, and to ask support if access does not activate", () => {
+        const { text, html } = render(largeKit(1));
         assert.match(text, /On the sign-in page, choose “Sign up”\. Enter your full name, “jordan\.lee@example\.com” as the email, and a password of at least 8 characters, then select “Create account”\./);
         assert.match(text, /Use exactly “jordan\.lee@example\.com”, the email address used for your purchase/);
-        assert.match(text, /If you see “Account not authorized”, please contact us at support@healthexporesources\.com/);
-        assert.match(text, /After you create the account the page may say it “requires admin approval”\. For your purchase no extra approval step is needed/);
+        // No approval step: said plainly, and tied to the purchase address.
+        assert.match(text, /There is no approval step and nothing to wait for: as an eligible purchaser you can sign in as soon as your account is created\. Your workspace is already linked to the email address used for your purchase, so always sign in with “jordan\.lee@example\.com”\./);
+        // Support is still offered when access does not activate.
+        assert.match(text, /If you see “Account not authorized”, or your workspace does not appear after you sign in, please contact us at support@healthexporesources\.com\./);
+        // The HTML says the same thing, with the address and support link intact.
+        assert.ok(html.includes("There is no approval step and nothing to wait for"), "HTML has the no-approval sentence");
+        assert.ok(html.includes('<a href="mailto:support@healthexporesources.com"'), "HTML keeps the support link");
+    });
+
+    it("never mentions an approval the portal does not require (the old sign-up notice is gone)", () => {
+        for (const kit of [smallKit(1), largeKit(1), dyha(3)]) {
+            const { text, html } = render(kit);
+            for (const body of [text, html]) {
+                assert.doesNotMatch(body, /requires admin approval|admin approval is required|platform admin will review|awaiting approval|wait for (an )?admin/i);
+                assert.doesNotMatch(body, /the page may say/i);
+            }
+        }
     });
 
     it("sends additional members to the app, not the portal (the portal only admits owners and admins)", () => {
@@ -505,9 +520,12 @@ describe("onboarding email: every label it quotes exists in the Admin Portal", {
         assert.match(signIn, /title="Sign in"/);
         assert.match(signIn, /<AuthLink href="\/workspace-admin">Sign up<\/AuthLink>/);
         const signUp = file("components", "workspaces", "WorkspaceAuthScreen.tsx");
-        for (const label of ["Full name", "Work email", "Password", "Create account", "At least 8 characters", "requires admin approval"]) {
+        for (const label of ["Full name", "Work email", "Password", "Create account", "At least 8 characters"]) {
             assert.ok(signUp.includes(label), label);
         }
+        // The email says there is no approval step, so the sign-up screen must not claim one.
+        assert.doesNotMatch(signUp, /requires admin approval|platform admin will review|A platform admin approves/i);
+        assert.ok(signUp.includes("No approval is needed"), "the sign-up confirmation says no approval is needed");
         assert.match(signUp, /NAME_PATTERN = \/\^\[A-Za-z\]\[A-Za-z0-9 \]\*\$\//, "letters, numbers and spaces; must start with a letter");
         assert.match(signUp, /minLength=\{8\}/);
     });
