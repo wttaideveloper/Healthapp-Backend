@@ -360,7 +360,7 @@ function printSampleSummary(input: {
     console.log("             No customers, database, CSV, workspaces or email ledger are involved.");
     console.log("");
     console.log(`  Recipients (${mode.testRecipients.length}, exactly as given): ${mode.testRecipients.join(", ")}`);
-    console.log(`  Sample product  : ${mode.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT} (--sample-product=small|large|dyha)`);
+    console.log(`  Sample product  : ${mode.sampleProduct ?? DEFAULT_SAMPLE_PRODUCT} (--sample-product=existing|small|large|dyha)`);
     console.log(`  Sample customer : ${SAMPLE_CUSTOMER_NAME}`);
     console.log(`  Sample dates    : ${SAMPLE_START_DATE}  ->  ${SAMPLE_EXPIRY_DATE}`);
     console.log(`  Support address : ${emailConfig.supportEmail ?? "NOT SET"}`);

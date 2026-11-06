@@ -52,8 +52,14 @@ export const TEST_MODE_HEADER = "X-HealthAge-Migration-Email-Mode";
 /** A test run sends for one customer unless told otherwise. */
 export const DEFAULT_TEST_LIMIT = 1;
 
-/** Which product's email a `--sample` run shows. */
-export const SAMPLE_PRODUCTS = ["small", "large", "dyha"] as const;
+/**
+ * Which email a `--sample` run shows.
+ *   existing  Discover Your Health Age, 1 license    (existing-customer email, direct route)
+ *   small     Small Venue Kit, 1 license             (direct route, no Admin Portal)
+ *   large     Large Venue Kit, 4 licenses            (workspace route)
+ *   dyha      Discover Your Health Age - 3, 3 licenses (existing-customer email, workspace route)
+ */
+export const SAMPLE_PRODUCTS = ["existing", "small", "large", "dyha"] as const;
 export type SampleProduct = (typeof SAMPLE_PRODUCTS)[number];
 /** The richest variant (owner + invited members), so the default sample shows every section. */
 export const DEFAULT_SAMPLE_PRODUCT: SampleProduct = "large";
@@ -86,7 +92,7 @@ export type SendEmailsArgs = {
 };
 
 const SUPPORTED_FLAGS =
-    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --sample, --send-sample, --sample-product=small|large|dyha, --allow-missing-platform-links, --csv=, --out=";
+    "--dry-run, --send, --all, --limit=N, --only-emails=a@x.com,b@y.com, --test-recipients=a@x.com,b@y.com, --sample, --send-sample, --sample-product=existing|small|large|dyha, --allow-missing-platform-links, --csv=, --out=";
 
 /**
  * Unrecognised arguments are rejected, never ignored. In particular the stage 1
@@ -926,6 +932,11 @@ export function buildSamplePurchase(product: SampleProduct): PurchaseSummary {
         return { licenses: line.licenses, lines: [line] };
     };
     switch (product) {
+        case "existing": {
+            // "Discover Your Health Age - 1": a single-license software purchase.
+            const line = purchaseLine("discover_your_health_age", 1, 1);
+            return { licenses: line.licenses, lines: [line] };
+        }
         case "small":
             return kit("health_expo_screening_kit_small");
         case "large":

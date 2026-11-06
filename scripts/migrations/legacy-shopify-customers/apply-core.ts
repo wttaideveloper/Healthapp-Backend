@@ -77,6 +77,12 @@ export const DEFAULT_HEALTHAGE_ANDROID_URL =
 /** Published Microsoft Store listing. Used when HEALTHAGE_WINDOWS_URL is unset. */
 export const DEFAULT_HEALTHAGE_WINDOWS_URL = "https://apps.microsoft.com/detail/9P8MFP2CBVL5";
 
+/** Published App Store listing. Used when HEALTHAGE_IOS_URL is unset. */
+export const DEFAULT_HEALTHAGE_IOS_URL = "https://apps.apple.com/in/app/health-age/id6744716742";
+
+/** HealthAge macOS download page. Used when HEALTHAGE_MACOS_URL is unset. */
+export const DEFAULT_HEALTHAGE_MACOS_URL = "https://healthage.healthexporesources.com/download/";
+
 /** Canonical customer support address. Not EMAIL_FROM. */
 export const DEFAULT_HEALTHAGE_SUPPORT_EMAIL = "support@healthexporesources.com";
 
@@ -269,8 +275,8 @@ export function readEmailConfig(env: Record<string, string | undefined> = proces
     return {
         androidUrl: optionalUrl(env.HEALTHAGE_ANDROID_URL) ?? DEFAULT_HEALTHAGE_ANDROID_URL,
         windowsUrl: optionalUrl(env.HEALTHAGE_WINDOWS_URL) ?? DEFAULT_HEALTHAGE_WINDOWS_URL,
-        iosUrl: optionalUrl(env.HEALTHAGE_IOS_URL),
-        macosUrl: optionalUrl(env.HEALTHAGE_MACOS_URL),
+        iosUrl: optionalUrl(env.HEALTHAGE_IOS_URL) ?? DEFAULT_HEALTHAGE_IOS_URL,
+        macosUrl: optionalUrl(env.HEALTHAGE_MACOS_URL) ?? DEFAULT_HEALTHAGE_MACOS_URL,
         supportEmail: optionalUrl(env.HEALTHAGE_SUPPORT_EMAIL) ?? DEFAULT_HEALTHAGE_SUPPORT_EMAIL,
     };
 }

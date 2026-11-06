@@ -818,15 +818,14 @@ describe("legacy free-year email", () => {
             windowsUrl: MICROSOFT_STORE_URL,
             supportEmail: SUPPORT_EMAIL,
         });
-        assert.match(content.subject, /1 year of FREE access/i);
+        assert.equal(content.subject, "Important: Upgrade to the New Discover Your Health Age App – 1 Year FREE Access");
         assert.match(content.text, /Pastor Rodney Bowes/);
         assert.doesNotMatch(content.text, /workspace-admin/);
         assert.doesNotMatch(content.subject, /Workspace Admin/);
 
-        // The onboarding email now DELIBERATELY links to the Admin Portal (current address only).
+        // A single-license purchase uses the app directly, so it does not link the Admin Portal at all.
         // What must never come back is the live owner-welcome copy and its retired address.
         for (const body of [content.text, content.html]) {
-            assert.match(body, /https:\/\/healthage\.healthexporesources\.com\//);
             assert.doesNotMatch(body, /Visit:/);
             assert.doesNotMatch(body, /Pro account|Your Pro access will automatically/);
             assert.doesNotMatch(body, /vercel\.app/);
@@ -893,7 +892,7 @@ describe("legacy free-year email", () => {
         });
         assert.match(content.text, /iOS: https:\/\/apps\.apple\.com\/example-ios/);
         assert.match(content.text, /macOS: https:\/\/apps\.apple\.com\/example-macos/);
-        assert.match(content.text, /Android • Windows • iOS • macOS/);
+        assert.match(content.text, /Android • iOS • Windows • macOS/);
         assert.match(content.html, /Download for iOS/);
         assert.match(content.html, /Download for macOS/);
     });
@@ -915,13 +914,16 @@ describe("legacy free-year email", () => {
         assert.doesNotMatch(content.text, /HEALTHAGE_APP_URL/);
     });
 
-    it("reads store URLs and support email from env without inventing iOS or macOS listings", () => {
+    it("reads store URLs and support email from env, falling back to the published listings for all four platforms", () => {
         const config = readEmailConfig({});
         assert.equal(config.androidUrl, PLAY_STORE_URL);
         assert.equal(config.windowsUrl, MICROSOFT_STORE_URL);
-        assert.equal(config.iosUrl, null);
-        assert.equal(config.macosUrl, null);
+        assert.equal(config.iosUrl, "https://apps.apple.com/in/app/health-age/id6744716742");
+        assert.equal(config.macosUrl, "https://healthage.healthexporesources.com/download/");
         assert.equal(config.supportEmail, SUPPORT_EMAIL);
+        // A blank variable is the same as an unset one: the default applies.
+        assert.equal(readEmailConfig({ HEALTHAGE_IOS_URL: "   ", HEALTHAGE_MACOS_URL: "" }).iosUrl, config.iosUrl);
+        assert.equal(readEmailConfig({ HEALTHAGE_IOS_URL: "   ", HEALTHAGE_MACOS_URL: "" }).macosUrl, config.macosUrl);
         assert.deepEqual(emailConfigIssues(config), []);
         assert.ok(
             emailConfigIssues({
@@ -943,7 +945,7 @@ describe("legacy free-year email", () => {
         assert.equal(fromEnv.windowsUrl, MICROSOFT_STORE_URL);
         assert.equal(fromEnv.supportEmail, "help@healthage.example");
         assert.equal(fromEnv.iosUrl, "https://apps.apple.com/configured-ios");
-        assert.equal(fromEnv.macosUrl, null);
+        assert.equal(fromEnv.macosUrl, "https://healthage.healthexporesources.com/download/");
         assert.equal(fromEnv.iosUrl?.includes("health-age.vercel.app"), false);
     });
 });
@@ -962,15 +964,28 @@ describe("Shopify live licensing isolation", () => {
     const importsOf = (file: string): string[] =>
         [...readFileSync(join(migrationDir, file), "utf8").matchAll(/\bfrom\s+["']([^"']+)["']/g)].map((match) => match[1]!);
 
-    it("migration scripts import nothing from the application src/ tree, so the webhook flow is never on their path", () => {
+    it("migration scripts import nothing from the application src/ tree (except the pure email design module), so the webhook flow is never on their path", () => {
         assert.ok(sourceFiles.length >= 10, "expected the migration source files to be found");
+        // The ONE allowed exception: the shared email layout, which has no imports of its own (checked below),
+        // so it can reach neither the environment, the database, SMTP nor the Shopify webhook flow.
+        const PURE_EMAIL_DESIGN = "../../../src/core/email/email-document";
         for (const file of sourceFiles) {
             for (const specifier of importsOf(file)) {
+                if (specifier === PURE_EMAIL_DESIGN) {
+                    assert.equal(file, "migration-email.ts", `only the email builder may use the shared design module (${file})`);
+                    continue;
+                }
                 assert.doesNotMatch(specifier, /(^|\/)src\//, `${file} imports ${specifier}`);
                 assert.doesNotMatch(specifier, /^@(modules|db|core|plugins|config)\//, `${file} imports ${specifier}`);
                 assert.doesNotMatch(specifier, /shopify\.(service|route|admin)/, `${file} imports ${specifier}`);
             }
         }
+    });
+
+    it("the shared email design module the scripts may import is a pure leaf: no imports, no environment, no SMTP", () => {
+        const source = readFileSync(resolve(process.cwd(), "src/core/email/email-document.ts"), "utf8");
+        assert.equal(/^\s*import\s/m.test(source), false, "it imports nothing, so it cannot reach the webhook flow, the database or the environment");
+        assert.doesNotMatch(source, /process\.env|require\(|nodemailer|from\s+["']/);
     });
 
     it("planning and apply-decision modules are pure: no database driver and no mail transport", () => {
@@ -1610,9 +1625,9 @@ describe("email safety", () => {
             windowsUrl: MICROSOFT_STORE_URL,
             supportEmail: SUPPORT_EMAIL,
         });
-        assert.equal(content.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
-        assert.match(content.text, /Start Date: 4 November 2026\nExpires: 4 November 2027/);
-        assert.match(content.text, /- Pastor Rodney Bowes$/);
+        assert.equal(content.subject, "Important: Upgrade to the New Discover Your Health Age App – 1 Year FREE Access");
+        assert.match(content.text, /Start Date: 4 November 2026\nExpiry Date: 4 November 2027/);
+        assert.match(content.text, /Warm regards,\nPastor Rodney Bowes\nHealthAge Support Team\nDiscover Your Health Age$/);
         assert.doesNotMatch(content.text, /\biOS:|\bmacOS:/);
     });
 });

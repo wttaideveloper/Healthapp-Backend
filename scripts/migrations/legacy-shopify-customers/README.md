@@ -68,7 +68,11 @@ held one added later.
 | `send-emails.ts` | **Stage 2** CLI. Sends the free-year email to migrated customers who have not had it. Default is preview. |
 | `send-emails-core.ts` | Stage 2 logic: who is owed the email, mode and flag rules, the recipient guard, the lock → send → ledger flow. No database driver, no mail library. |
 | `email-transport.ts` | Builds and sends the approved email over SMTP for both stages. Imports no mail library; the CLIs inject it. |
-| `migration-email.ts` | Free-year grant email copy. Not the live Shopify owner-welcome mail. |
+| `migration-email.ts` | The three onboarding templates (existing customer, Small Venue Kit, Large Venue Kit), template selection from the SKU-derived products, and the subjects. Not the live Shopify owner-welcome mail. |
+| `purchase-summary.ts` | What a customer bought and how many licenses each product is worth, from the plan, for the emails. |
+| `migration-email.test.ts` | Template mapping and content for every template, HTML safety and parity, and drift guards against the portal, backend and mobile app. |
+| `../../../src/core/email/email-document.ts` | The shared email design system (HTML and text renderers). A pure leaf with no imports; the only application module these scripts may import. |
+| `../../../src/modules/workspace/workspace.invite-template.ts` | The workspace invitation / owner-welcome email, on the same design system. |
 | `apply.test.ts` | Eligibility, skip, idempotency, expiry, dry-run, and email-safety tests. |
 | `send-emails.test.ts` | Stage 2 tests: ledger, retries, limits, test mode, guards, transport, and a full stage 1 → stage 2 run on the real export. |
 
@@ -143,15 +147,18 @@ pnpm migrate:legacy-shopify:send-emails "--test-recipients=you@yourdomain.com,co
 
 Test-email checklist:
 
-1. The subject is `Your 1 year of FREE access to the new Discover Your Health Age App`.
+1. The subject is the one for that customer's product (see "The emails"): the
+   existing-customer, Small Venue Kit or Large Venue Kit subject.
 2. The greeting is a customer's billing name (it is a real customer's content),
-   and the email names that customer's own sign-in address and workspace.
-3. The headline and "Your access" card state the license count the migration
-   wrote (compare with `workspaces.seat_limit`); `Start Date` is the stage 1 run
-   date and `Expires` is 365 days later, both shown in full ("4 November 2026").
-4. Android and Windows links open the right listings; **iOS and macOS links are
-   present and correct** (they appear only when `HEALTHAGE_IOS_URL` /
-   `HEALTHAGE_MACOS_URL` are set).
+   and the email names that customer's own sign-in address (and workspace, when
+   they have more than one license).
+3. The "Your Free Access" card states the license count the migration wrote
+   (compare with `workspaces.seat_limit`); `Start Date` is the stage 1 run date and
+   `Expiry Date` is 365 days later, both shown in full ("4 November 2026"). A
+   one-license customer's email has no Admin Portal, workspace or invitation steps.
+4. All four platform links (Android, iOS, Windows, macOS) open the right pages.
+   They default to the published listings and can be overridden with
+   `HEALTHAGE_*_URL`.
 5. The support address is correct.
 6. The message carries the header `X-HealthAge-Migration-Email-Mode: test`. The
    subject and body are exactly what that customer would receive; only this
@@ -247,77 +254,228 @@ Start date is the workspace expiry minus 365 days, i.e. the stage 1 run date.
 Reports are written to `migration-reports/` (git-ignored; they contain customer
 addresses).
 
-## The onboarding email
+## The emails
 
-Each customer gets one responsive HTML email (navy, white and subtle gold, inline
-CSS only, no scripts or external files) with a complete plain-text version. Both
-are built from one structured model, so they always say the same thing. It is
-personalised from what the migration actually did for that customer: billing
-name, the address they must sign in with, their workspace, what they bought, how
-many licenses that is, the real start and expiry dates, the Admin Portal address,
-the four store links and the support address. The subject is unchanged: *Your 1
-year of FREE access to the new Discover Your Health Age App*.
+There are two families of customer email. Both are built from one design system
+(`src/core/email/email-document.ts`): a structured document rendered to a responsive
+HTML email (navy, white and subtle gold; tables and inline CSS only; no scripts,
+images or external files) and a complete plain-text version, from the same data, so
+they always say the same thing. Every dynamic value is escaped in the HTML and a link
+is only emitted if it is a plain http(s) URL.
 
-**The license count is never recomputed by the email.** It comes from the plan's
-own calculation (the one the dry run prints, SKU and quantity included) and is
+1. **The onboarding emails** (this migration): one per purchase, three templates.
+2. **The workspace invitation email** (the live API): sent when an owner or admin
+   invites a member. Described under "The workspace invitation email" below.
+
+The details card (purchase, licenses, address, dates) is fluid: label and value sit side
+by side on desktop and stack on a phone, so an address is never broken mid-word and
+nothing can overflow at any screen width (240px to 900px was measured in a browser). It
+uses no media queries, which many mail clients strip; Outlook for Windows gets a
+two-column table through conditional comments. The sizes live in `DETAILS_LAYOUT`.
+
+**Sending any of them to real customers is a separate, explicit authorisation.**
+Nothing here sends mail when the code is deployed, and every test uses a fake mail
+server.
+
+### The onboarding emails: three templates
+
+| Template | Chosen when the purchase contains | Subject |
+| --- | --- | --- |
+| `existing_customer` | Discover Your Health Age software only (SKU `008`) | Important: Upgrade to the New Discover Your Health Age App – 1 Year FREE Access |
+| `small_venue_kit` | a Small Venue Kit (SKU `004-1`), and no Large Venue Kit | Your Small Venue Kit – Upgrade to the New HealthAge App with 1 Year FREE Access |
+| `large_venue_kit` | a Large Venue Kit (SKU `004-2`) | Your Large Venue Kit – Upgrade to the New HealthAge App with 1 Year FREE Access |
+
+The product kind comes from the plan's own SKU-first classification
+(`ELIGIBLE_PRODUCTS`, via `purchase-summary.ts`). The email layer never matches a
+product name. A purchase mixing products gets a deterministic template (Large, then
+Small, then software) and **nothing is discarded**: the email lists every product line
+with its own license count and the combined total.
+
+**The route follows the real license count**, not the product name:
+
+| Licenses | Route | Steps |
+| --- | --- | --- |
+| 1 | **Direct.** Download the app, sign in or **Create Account**, start. No Admin Portal, workspace or invitation instructions at all. | Download · Sign in · Start |
+| 2 or more | **Workspace.** The owner opens the Admin Portal, signs in (or signs up) with the purchase email, finds the workspace under **My Workspaces**, checks the counter ("1 of N licenses used"), invites members under **Members**, then downloads the app. Each member uses the app with their own account. | Portal · Sign in · Workspace · Licenses · Invite · Members start · then the four downloads |
+
+The license count is never recomputed by the email. It comes from the plan's own
+calculation (the one the dry run prints, SKU and quantity included) and is
 cross-checked against the workspace: if the workspace holds a different number of
 licenses than the plan allocates, that customer is held back as `license_mismatch`
 and nobody is told a wrong number. A customer with no qualifying purchase in the
 plan is held back as `no_qualifying_purchase`.
 
-### The journey the email describes (verified against the application)
+### Small Venue Kit and Large Venue Kit
+
+| | Small Venue Kit × 1 | Large Venue Kit × 1 |
+| --- | --- | --- |
+| Licenses | 1 (the purchaser's own) | 4 (1 owner + 3 for members) |
+| Route | Direct, in the app | Workspace, via the Admin Portal |
+| Admin Portal | **Never mentioned as a step**; the email only says it is not needed | Required: the owner manages the workspace there |
+| Member invitations | None | Up to 3, from **Members → Invite a Member** |
+| "Your Free Access" card | Purchase, Licenses, Registered Email, Access Period, Start, Expiry | Purchase, Licenses, Workspace Owner, Workspace, Start, Expiry |
+
+A Small Venue Kit works without the portal because workspace access is decided only
+by the account's active membership in an active workspace, never by its role
+(`entitlement.service.ts`), and the app unlocks Pro from the backend's `hasAccess`
+(`GET /entitlements/me`). Register or sign in with the purchase email and the license
+applies. Buying **two** Small Venue Kits is two licenses, so that purchaser gets the
+workspace route (otherwise the second license could not be handed to anyone).
+
+### Existing accounts and new customers
+
+Accounts live in this backend; the old software's accounts are **not** imported (the
+migration never creates users). So the emails never assume an account exists and never
+invent an account migration:
+
+- *Already have a HealthAge account?* Sign in with the existing email address and
+  password. **Forgot password?** on the app's sign-in screen resets it
+  (`/auth/forgot-password`, `/auth/reset-password`).
+- *New to the HealthAge app?* **Create Account** with the same email address used for
+  the purchase. The membership created by the migration is claimed automatically at
+  registration or login.
+- The existing-customer email adds: "if you already have an account, please do not
+  create a second one".
+- Every email says to use the purchase email address (the free access is linked to
+  it), that there is no approval step, and to contact support if the portal says
+  "Account not authorized" or the workspace does not appear.
+
+### The journey the emails describe (verified against the application)
 
 | # | What the customer does | Where it is verified |
 | --- | --- | --- |
-| 1 | Opens the Admin Portal, which shows **Sign in** and "Need a workspace admin account? **Sign up**". | Portal `AdminAuthScreen.tsx` |
+| 1 | Opens the Admin Portal, which shows **Sign in** and "Need a workspace admin account? **Sign up**". (Workspace route only.) | Portal `AdminAuthScreen.tsx` |
 | 2 | First time: **Sign up**, then *Full name* (letters, numbers, spaces, starting with a letter), *Work email*, *Password* (8+), then **Create account**. | Portal `WorkspaceAuthScreen.tsx`; `POST /api/v1/auth/register` |
-| 3 | The backend creates an **active** account and claims the invited owner seat for that exact email. No approval step exists: the sign-up confirmation says so, and so does the email. The purchaser signs in straight away with the purchase email, and contacts support if the portal says "Account not authorized" or the workspace does not appear. | `auth.route.ts` (register and login both call `linkWorkspaceMembershipsForUser`) |
+| 3 | The backend creates an **active** account and claims the invited owner seat for that exact email. No approval step exists: the sign-up confirmation says so, and so do the emails. | `auth.route.ts` (register and login both call `linkWorkspaceMembershipsForUser`) |
 | 4 | **Sign in.** The portal admits platform admins and *active* workspace owners/admins; anyone else sees "Account not authorized." (the email tells them to contact support). | Portal `page.tsx` `onLogin` |
 | 5 | Lands on **My Workspaces**. "Manage Organization Members" shows **"1 of N licenses used"**: the owner uses one. | Portal `MembersView.tsx`, `storage.ts` |
-| 6 | If N > 1: **Members**, then **Invite a Member** with *Email*, *Role* (leave **member**) and **Invite**. Active members and pending invitations both use a license. The backend emails the invitee. | `MembersView.tsx`; `POST /api/v1/workspaces/:id/members` (owner/admin only, seat check includes the owner) |
-| 7 | Each invited member uses the **app**, not the portal (the portal rejects plain members): **Create account** (or sign in) with the invited email. The license activates automatically; no checkout. | Mobile app `SignInScreen`, `SignUpScreen`, `i18n.ts` |
-| 8 | Downloads the app and signs in with the same email and password. | Mobile app `authService.ts` (no email-verification step exists) |
+| 6 | If N > 1: **Members**, then **Invite a Member** with *Email*, *Role* (leave **member**) and **Invite**. Active members and pending invitations both use a license. The backend emails the invitee. | `MembersView.tsx`; `POST /api/v1/workspaces/:id/members` (owner/admin only, the owner's seat counts) |
+| 7 | Each invited member uses the **app**, not the portal (the portal rejects plain members): **Create Account** (or **Sign In**) with the invited email. The license activates automatically; no checkout. | Mobile app `i18n.ts`, `authService.ts`, `purchase.ts` |
+| 8 | With one license: downloads the app and signs in or creates an account with the purchase email. | Mobile app (no email-verification step exists) |
 
-A test reads the real Admin Portal, backend and mobile-app sources and fails if
-any quoted label or any of these behaviours disappears (the portal and app checks
-skip themselves when those projects are not checked out next to this one).
+A test reads the real Admin Portal, backend and mobile-app sources and fails if any
+quoted label or any of these behaviours disappears (the portal and app checks skip
+themselves when those projects are not checked out next to this one).
 
-### What differs by product
+### The workspace invitation email
 
-| Purchase | Headline | Licenses | Steps | License box |
-| --- | --- | --- | --- | --- |
-| Small Venue Kit × 1 | "Your Small Venue Kit includes 1 license." | 1 | 7: no member steps | "One license, and it's yours" + "No additional member seats are included" |
-| Large Venue Kit × 1 | "Your Large Venue Kit includes 4 licenses." | 4 | 9: adds "Invite your additional members" and "What each additional member does" | "4 licenses: 1 for you and 3 for your team" |
-| Discover Your Health Age, N licenses | "Your Discover Your Health Age purchase includes N licenses." | N | 7 if N = 1, otherwise 9 | as above, with N − 1 invitations |
-| Several kits, or a mixed purchase | "Your 2 Large Venue Kits include 8 licenses." / "Your purchases include 11 licenses in total." | the real total | by total | every product is listed in "Your access" |
+Built by `src/modules/workspace/workspace.invite-template.ts` on the same design
+system, and used by **every** place that invites someone: the owner/admin invite route,
+the platform-admin routes, and the Shopify owner welcome. There used to be three copies
+of the text (and the values were not escaped in the HTML); there is now one builder,
+`getWorkspaceInviteEmailContent` in `workspace.email.ts`.
 
-Preview any variant (synthetic data, nothing sent, no database or CSV):
+- **Member invitation** (the default): "You've Been Invited to HealthAge!", who invited
+  them (when known), the workspace, the invited address, the role, and the date access
+  runs to (the workspace's expiry, when it has one). It says they do not need a
+  subscription, then four steps: use the invited address, download the app (all four
+  platform buttons), **Create Account** or **Sign In**, start. It does **not** send a
+  plain member to the Admin Portal, which only admits owners and admins. An invited
+  *admin* also gets the portal link.
+- **Owner / administrator welcome**: the Admin Portal button and steps. Keeps its subject
+  (and the custom subjects the Shopify flow passes in).
+- **There is no "Accept Invitation" link, and none is invented.** The application has no
+  invitation token, link or expiry: an invitation is a membership row that is claimed
+  automatically when the person registers or signs in with that address. So the email
+  says to use the invited address. If an invitation link is ever introduced, pass it as
+  `acceptInvitationUrl` and the email renders an Accept Invitation button with a visible
+  fallback URL; nothing else needs to change.
+- The store links and the support address can be overridden per environment
+  (`HEALTHAGE_ANDROID_URL`, `HEALTHAGE_IOS_URL`, `HEALTHAGE_WINDOWS_URL`,
+  `HEALTHAGE_MACOS_URL`, `HEALTHAGE_SUPPORT_EMAIL`); the defaults are in
+  `workspace.links.ts`, the single source, and a test keeps the migration's defaults
+  equal to them.
+- The inviter's name is looked up best-effort after the invitation is saved; if the
+  lookup fails the email says "Your workspace administrator" and is still sent.
+
+### The discontinuation notice
+
+Every onboarding email, and the invitation email for members of migrated workspaces,
+carries one announcement: **"Important: Discontinuation of the Previous HealthAge
+Software"** (we are discontinuing the previous version of HealthAge, the old software
+will no longer be supported, please switch to the new application, and the existing
+purchase includes one year of free access to the new version).
+
+- It is a navy panel with a gold rule and title and ivory text, so it is the strongest
+  element in the email, and it is framed with `====` lines in the plain-text version.
+  The wording lives once, in `src/core/email/email-document.ts`.
+- **Placement.** Onboarding emails: straight after the introduction, above the access
+  details, in all three templates and on both routes. Invitation email: after the
+  invitation facts and the "no subscription needed" note, before the steps.
+- **It gives no date and does not say the old software is already off**: only that it
+  is being discontinued and will no longer be supported. Tests fail on any digit, month
+  name or "already shut down" style claim in the notice.
+- **Member invitations.** Only members of workspaces created by this migration
+  (`billing_source = legacy_shopify_migration`) get it, because they are the people the
+  old software was sold to and their organization really does hold the free year. For
+  them the last sentence reads "Your *organization's* existing purchase includes one
+  year of free access", since a member did not make the purchase. Members of manual or
+  live-Shopify workspaces get no notice (they would be told about a purchase that is not
+  theirs). The routes decide it with `isLegacyMigrationWorkspace(workspace.billingSource)`;
+  to show it to every invited member, change that one expression in
+  `workspace.route.ts` and `admin-workspace.route.ts`. The owner welcome never carries it.
+- It does not replace anything: the product-specific steps, download links, sign-in
+  guidance, workspace instructions, invitation behaviour and the sending safeguards are
+  unchanged (the existing tests for all of them still pass).
+- **One announcement, not two.** The onboarding emails used to end with an "Important
+  Upgrade Information" section that repeated the notice (switch to the new app, it
+  replaces the previous version, the four platforms, the free year). It was removed. Its
+  two facts that were *not* repeats moved next to what they describe: "No additional
+  purchase or payment is required for your N licenses" now sits under "Your N Licenses"
+  (workspace route), and for a single Small Venue Kit "includes one license for your
+  personal use" and "You do not need to access the Admin Portal or invite additional
+  members" sit under "Your Free Access". A test fails if the switch request, "no longer
+  supported" or the transition message appears more than once in an email.
+
+### Previewing locally (nothing is sent)
 
 ```powershell
-pnpm migrate:legacy-shopify:send-emails --sample --sample-product=small "--test-recipients=you@yourdomain.com"
-pnpm migrate:legacy-shopify:send-emails --sample --sample-product=large "--test-recipients=you@yourdomain.com"
-pnpm migrate:legacy-shopify:send-emails --sample --sample-product=dyha  "--test-recipients=you@yourdomain.com"
+# All of these print the email and send nothing. Synthetic data; no database, CSV or mail server.
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=existing "--test-recipients=you@yourdomain.com"   # existing customer, 1 license (direct)
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=small    "--test-recipients=you@yourdomain.com"   # Small Venue Kit (direct)
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=large    "--test-recipients=you@yourdomain.com"   # Large Venue Kit (workspace)
+pnpm migrate:legacy-shopify:send-emails --sample --sample-product=dyha     "--test-recipients=you@yourdomain.com"   # software, 3 licenses (workspace)
+
+# The tests render every template and the invitation email, check them against the application, and use a fake mail server:
+pnpm test
 ```
+
+### Rolling it out safely
+
+1. Deploying the code sends nothing. Run `pnpm test`, `pnpm typecheck` and `pnpm build`.
+2. Before any send, open each link the emails use: the four store links (the macOS
+   link is a download page on the portal's host) and the Admin Portal address.
+   Confirm the macOS link points at a build where workspace access works (see "Known
+   limits").
+3. Stage 1 with `--no-email` (always). Preview first with `--dry-run`.
+4. Send yourself each sample (`--sample --send-sample`, to your own inboxes) and read
+   them on a phone and in Gmail and Outlook.
+5. Pilot with exact addresses (`--only-emails=`): one Small Venue Kit customer and one
+   Large Venue Kit customer. Watch their first sign-in.
+6. Then batches with `--limit=`, then everyone still pending. The ledger, the advisory
+   lock and the retry handling in "Failures, retries and the ledger" apply unchanged.
+7. **Each real send needs explicit authorisation.** Do not run `--send`, `--send-sample`
+   or `--all` without it.
 
 ### Known limits
 
 - **Mac App Store build.** In the mobile app, `mustUseAppStoreIapForPro()` is true
   for Mac App Store (Mac Catalyst, IAP) builds, and there workspace access must
-  **not** unlock Pro. The direct-download macOS build (DMG, web Stripe flow) is
-  unaffected. Make sure the approved macOS link points at a build where workspace
+  **not** unlock Pro. The direct-download macOS build (web Stripe flow) is
+  unaffected. The macOS link in the emails must point at a build where workspace
   access works.
-- The journey was verified by reading the code, not by running the portal. Watch
-  the first real customer's sign-up.
-- The backend's own member-invitation email still tells every invitee to visit
-  the Admin Portal first, although the portal only admits owners and admins. The
-  email described here sends members to the app instead. That backend email is
-  unchanged.
+- The journey was verified by reading the code, not by running the portal or the apps.
+  Watch the first real customer's sign-up.
+- The invitation email has no accept link or invitation expiry, because the
+  application has none (see above). It shows the workspace's access end date instead.
+- The company logo is not an image: there is no hosted logo URL, and an email must not
+  depend on one that does not exist. The header is a text wordmark.
 
 ## Sample email (synthetic, test inboxes only)
 
 `--sample` shows, and with `--send-sample` delivers, the real migration email
 filled with **made-up data** to inboxes you name. It involves no customers.
-`--sample-product=small|large|dyha` chooses which product's email it shows
+`--sample-product=existing|small|large|dyha` chooses which email it shows
 (default `large`); the license counts come from the real product rules.
 
 ```powershell
@@ -348,9 +506,10 @@ runs the real CLI against a fake mail server and a fake database):
   ledger. Sample mode is decided in `main()` before any of those is touched.
 - The sender refuses every address that is not on the `--test-recipients` list.
 - A sample **send** is refused unless all four links and the support address are
-  configured (`HEALTHAGE_ANDROID_URL`, `HEALTHAGE_WINDOWS_URL`,
-  `HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`). There is no override: a sample
-  missing a link would test the wrong email. The preview shows which are set.
+  usable (`HEALTHAGE_ANDROID_URL`, `HEALTHAGE_WINDOWS_URL`,
+  `HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`; each defaults to the published
+  listing, and a value that is not a plain http(s) URL is refused). There is no
+  override: a sample missing a link would test the wrong email.
 
 Because sample mode does not read the database or the export, it **cannot check
 whether a recipient is a real customer** (plain `--test-recipients` without
@@ -380,9 +539,10 @@ stages, and on nobody else. It exists for a controlled pilot with real customers
 - **Stage 2 still rechecks each customer under the advisory lock** (eligibility and
   the email ledger), and its sender refuses any address not on the list even if
   the plan were wrong.
-- Live sending still needs the approved iOS and macOS links in the environment
-  (`HEALTHAGE_IOS_URL`, `HEALTHAGE_MACOS_URL`); the email is the personalised
-  onboarding email described above.
+- A live send still refuses to start if any platform link is missing or unusable
+  (the iOS and macOS links now default to the published listings, so this only
+  trips on an invalid override); the email is the personalised onboarding email
+  described above. Before the first send, open all four links yourself.
 
 **Quote the flag in PowerShell.** An unquoted comma is an array operator, and
 through `pnpm` the list arrives as `a@x.com b@y.com` (rejected, so it fails
@@ -505,8 +665,9 @@ If both `--apply` and `--dry-run` are passed, dry-run wins and nothing is writte
 Unrecognised flags are rejected, so a mistyped `--no-emial` stops the run
 instead of being ignored and sending mail.
 
-**Until the iOS and macOS store links are approved, always pass `--no-email`.**
-Plain `--apply` still emails each customer after their transaction commits.
+**Always pass `--no-email` to stage 1.** Plain `--apply` emails each customer inline
+after their transaction commits, outside stage 2's ledger, recipient allowlist and
+retry handling. Send the emails with stage 2 (`send-emails.ts`) instead.
 
 Stage 1 never emails a customer it skipped as `SKIP_EXISTING`, so customers
 migrated with `--no-email` are emailed by stage 2 (`send-emails.ts`), described
@@ -516,30 +677,27 @@ in the runbook above.
 
 The free-year email is sent only after that customer's workspace/membership
 transaction commits. It is not sent in dry-run or with `--no-email`. Its content
-depends on the customer's product and license count (see "The onboarding email").
+depends on the customer's product and license count (see "The emails").
 
-Required before mail can be sent (do not invent placeholders):
-
-```bash
-HEALTHAGE_ANDROID_URL=https://play.google.com/store/apps/details?id=com.wtt.healthAge
-HEALTHAGE_WINDOWS_URL=https://apps.microsoft.com/detail/9P8MFP2CBVL5
-HEALTHAGE_SUPPORT_EMAIL=support@healthexporesources.com
-```
-
-Optional App Store links. Omit these until a real listing URL exists; the
-email will not show empty iOS or macOS rows:
+All five values below default to the published listings and the support address
+(they are also the defaults the invitation emails use, from
+`src/modules/workspace/workspace.links.ts`), so nothing has to be set. Set a
+variable only to override its default; a value that is not a plain http(s) URL is
+refused before any email is built:
 
 ```bash
-# HEALTHAGE_IOS_URL=
-# HEALTHAGE_MACOS_URL=
+# HEALTHAGE_ANDROID_URL=https://play.google.com/store/apps/details?id=com.wtt.healthAge
+# HEALTHAGE_IOS_URL=https://apps.apple.com/in/app/health-age/id6744716742
+# HEALTHAGE_WINDOWS_URL=https://apps.microsoft.com/detail/9P8MFP2CBVL5
+# HEALTHAGE_MACOS_URL=https://healthage.healthexporesources.com/download/
+# HEALTHAGE_SUPPORT_EMAIL=support@healthexporesources.com
 ```
 
 `EMAIL_FROM` is the SMTP From header and is separate from
 `HEALTHAGE_SUPPORT_EMAIL`. Do not replace `EMAIL_FROM` with the support
 address.
 
-The apply script also uses the Android, Windows, and support values above as
-defaults when the variables are unset. iOS and macOS have no defaults.
+A blank variable counts as unset (the default applies).
 
 If no store URL and no support email can be resolved, the workspace is still
 created and the email is reported as a configuration failure. Set the

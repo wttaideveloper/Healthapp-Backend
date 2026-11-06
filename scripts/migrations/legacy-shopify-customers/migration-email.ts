@@ -1,34 +1,72 @@
 /**
- * Free-year grant email for the legacy Shopify customer migration.
+ * Onboarding emails for the legacy Shopify customer migration (the free-year grant).
  *
- * This is NOT the live Shopify workspace-owner welcome mail. The copy, subject, and
- * placeholders are specific to the historical 2026 upgrade grant.
+ * This is NOT the live Shopify workspace-owner welcome mail. The copy and subjects are specific to
+ * the historical upgrade grant.
  *
- * The email is personalised from the customer's actual migration result: their name and
- * sign-in address, workspace name, product(s) and license count, and the real start and
- * expiry dates. It is built from ONE structured model that two renderers consume (a
- * responsive HTML email with inline CSS only, and a complete plain-text version), so the
- * two always say the same thing.
+ * Three templates, chosen from what the customer actually bought:
  *
- * Every instruction in the onboarding steps describes something the existing application
- * actually does (verified against the Admin Portal, the backend routes and the mobile
- * app). Do not add a step, a button name or an approval requirement that the product does
- * not have.
+ *   existing_customer  Discover Your Health Age (software, SKU 008)
+ *   small_venue_kit    Small Venue Kit (SKU 004-1)
+ *   large_venue_kit    Large Venue Kit (SKU 004-2)
  *
- * Store links are configuration, not a single obsolete web URL. Unconfigured platforms
- * are omitted rather than shown empty. Any configured link that is not a plain http(s)
- * URL is refused, never emitted.
+ * The product kinds come from the migration plan's own SKU-first classification (`ELIGIBLE_PRODUCTS`,
+ * via `purchase-summary.ts`); nothing here matches product names. Which STEPS the email shows depends on
+ * the real license count, not on the product name:
+ *
+ *   1 license  -> direct route: download the app, sign in or create an account, done. No Admin Portal,
+ *                 no workspace or member instructions.
+ *   2+ licenses-> workspace route: the owner opens the Admin Portal, checks the license counter and
+ *                 invites the additional members (each uses the app with their own account).
+ *
+ * A purchase is never reduced to one product: the email lists every line and the total.
+ *
+ * The email is built as a structured document from the shared design system
+ * (`src/core/email/email-document.ts`): one HTML renderer (tables + inline CSS only) and one plain-text
+ * renderer, so the two always say the same thing.
+ *
+ * Every instruction describes something the application actually does (verified against the Admin
+ * Portal, the backend routes and the mobile app). Do not add a step, a button name or an approval
+ * requirement that the product does not have.
+ *
+ * Store links are configuration. Unconfigured platforms are omitted rather than shown empty, and any
+ * configured link that is not a plain http(s) URL is refused, never emitted.
  */
 
-/** The approved subject. Unchanged from the plain-text email. */
-export const FREE_YEAR_EMAIL_SUBJECT = "Your 1 year of FREE access to the new Discover Your Health Age App";
+import {
+    bold,
+    buildStoreLinks,
+    count,
+    discontinuationNoticeBlock,
+    formatEmailDate,
+    isMailbox,
+    isSafeHttpUrl,
+    renderEmailDocument,
+    type Block,
+    type EmailDocument,
+    type Rich,
+    type Segment,
+    type Step,
+    type StoreLink,
+} from "../../../src/core/email/email-document";
+
+export { formatEmailDate, isSafeHttpUrl };
 
 /**
- * The HealthAge Admin / Workspace Admin portal. Scripts must not import application code,
- * so this repeats `WORKSPACE_ADMIN_URL` from `src/modules/workspace/workspace.links.ts`;
+ * The HealthAge Admin / Workspace Admin portal. Scripts do not import application modules that read
+ * the environment, so this repeats `WORKSPACE_ADMIN_URL` from `src/modules/workspace/workspace.links.ts`;
  * a test keeps the two identical.
  */
 export const ADMIN_PORTAL_URL = "https://healthage.healthexporesources.com/";
+
+/** The three templates and their subjects. */
+export const EMAIL_SUBJECTS = {
+    existing_customer: "Important: Upgrade to the New Discover Your Health Age App – 1 Year FREE Access",
+    small_venue_kit: "Your Small Venue Kit – Upgrade to the New HealthAge App with 1 Year FREE Access",
+    large_venue_kit: "Your Large Venue Kit – Upgrade to the New HealthAge App with 1 Year FREE Access",
+} as const;
+
+export type EmailTemplateKind = keyof typeof EMAIL_SUBJECTS;
 
 export type PurchaseKind = "dyha" | "small_venue_kit" | "large_venue_kit";
 
@@ -71,84 +109,37 @@ export type FreeYearEmailContent = {
     readonly html: string;
 };
 
-type StoreLink = { readonly label: string; readonly url: string };
-
 export function inferMigrationCustomerDisplayName(email: string, explicitName?: string | null): string {
     if (explicitName && explicitName.trim().length > 0) return explicitName.trim();
     const localPart = email.split("@")[0] ?? "there";
     return localPart || "there";
 }
 
+/** The configured platform links, in the order customers see them (Android, iOS, Windows, macOS). */
 export function configuredStoreLinks(input: Pick<FreeYearEmailInput, "androidUrl" | "windowsUrl" | "iosUrl" | "macosUrl">): StoreLink[] {
-    const links: StoreLink[] = [];
-    if (input.androidUrl?.trim()) links.push({ label: "Android", url: input.androidUrl.trim() });
-    if (input.windowsUrl?.trim()) links.push({ label: "Windows", url: input.windowsUrl.trim() });
-    if (input.iosUrl?.trim()) links.push({ label: "iOS", url: input.iosUrl.trim() });
-    if (input.macosUrl?.trim()) links.push({ label: "macOS", url: input.macosUrl.trim() });
-    return links;
-}
-
-/** Only plain http(s) URLs may become links. Anything else (javascript:, data:, spaces, quotes) is refused. */
-export function isSafeHttpUrl(value: string): boolean {
-    return /^https?:\/\/[^\s"'<>`\\]+$/i.test(value);
-}
-
-function isMailbox(value: string): boolean {
-    return /^[^\s<>"'@]+@[^\s<>"'@]+\.[^\s<>"'@]+$/.test(value);
+    return buildStoreLinks({ android: input.androidUrl, ios: input.iosUrl, windows: input.windowsUrl, macos: input.macosUrl });
 }
 
 // ---------------------------------------------------------------------------
-// Small text helpers
+// Template selection
 // ---------------------------------------------------------------------------
 
-const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-
-/** `2026-11-04` -> `4 November 2026`. Anything that is not an ISO date (e.g. a sample label) is returned unchanged. */
-export function formatEmailDate(value: string): string {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-    if (!match) return value;
-    const month = Number(match[2]);
-    const day = Number(match[3]);
-    if (month < 1 || month > 12 || day < 1 || day > 31) return value;
-    return `${day} ${MONTHS[month - 1]} ${match[1]}`;
+/**
+ * Which template a purchase gets. Decided from the SKU-derived product kinds, in a fixed order:
+ * a Large Venue Kit, then a Small Venue Kit, otherwise the software. A mixed purchase therefore gets a
+ * deterministic headline, and nothing is lost: the email still lists every product line and the total
+ * license count, and shows the workspace route whenever there is more than one license.
+ */
+export function selectEmailTemplate(purchase: PurchaseSummary): EmailTemplateKind {
+    const kinds = new Set(purchase.lines.map((line) => line.kind));
+    if (kinds.has("large_venue_kit")) return "large_venue_kit";
+    if (kinds.has("small_venue_kit")) return "small_venue_kit";
+    return "existing_customer";
 }
 
-const count = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`;
-
-// ---------------------------------------------------------------------------
-// The structured model
-// ---------------------------------------------------------------------------
-
-/** Inline content: plain text, a bold UI label, or a link. Rendered as text or HTML, never concatenated unescaped. */
-type Segment = string | { readonly b: string } | { readonly link: string } | { readonly mail: string };
-type Rich = readonly Segment[];
-const bold = (value: string): Segment => ({ b: value });
-
-type Step = {
-    readonly title: string;
-    readonly body: readonly Rich[];
-    readonly items?: readonly Rich[];
-    /** Render the platform download buttons inside this step. */
-    readonly downloads?: boolean;
-};
-
-type Model = {
-    readonly subject: string;
-    readonly preheader: string;
-    readonly greeting: string;
-    readonly intro: readonly string[];
-    readonly headline: string;
-    readonly summary: ReadonlyArray<{ readonly label: string; readonly lines: readonly string[] }>;
-    readonly notice: { readonly title: string; readonly body: readonly string[] };
-    readonly portalUrl: string;
-    readonly steps: readonly Step[];
-    readonly downloads: readonly StoreLink[];
-    readonly availableOn: string;
-    readonly help: Rich;
-    readonly closing: readonly string[];
-    readonly signOff: string;
-    readonly recipientNote: string;
-};
+export function emailSubjectFor(purchase: PurchaseSummary): string {
+    return EMAIL_SUBJECTS[selectEmailTemplate(purchase)];
+}
 
 function assertValidPurchase(purchase: PurchaseSummary): void {
     const sum = purchase.lines.reduce((total, line) => total + line.licenses, 0);
@@ -162,67 +153,203 @@ function assertValidPurchase(purchase: PurchaseSummary): void {
     }
 }
 
-/** "Your Large Venue Kit includes 4 licenses." and its variants, always from the real counts. */
-function describePurchase(purchase: PurchaseSummary): { headline: string; productLines: string[] } {
+/** "Your Large Venue Kit includes 4 licenses" and its variants, always from the real counts (no trailing punctuation). */
+function describePurchase(purchase: PurchaseSummary): string {
     const n = purchase.licenses;
     const only = purchase.lines.length === 1 ? purchase.lines[0] : undefined;
-
-    let headline: string;
     if (only && only.kind === "small_venue_kit") {
-        headline =
-            only.units === 1
-                ? `Your Small Venue Kit includes ${count(n, "license")}.`
-                : `Your ${only.units} Small Venue Kits include ${count(n, "license")}.`;
-    } else if (only && only.kind === "large_venue_kit") {
-        headline =
-            only.units === 1
-                ? `Your Large Venue Kit includes ${count(n, "license")}.`
-                : `Your ${only.units} Large Venue Kits include ${count(n, "license")}.`;
-    } else if (only && only.kind === "dyha") {
-        headline = `Your Discover Your Health Age purchase includes ${count(n, "license")}.`;
-    } else {
-        headline = `Your purchases include ${count(n, "license")} in total.`;
+        return only.units === 1 ? `Your Small Venue Kit includes ${count(n, "license")}` : `Your ${only.units} Small Venue Kits include ${count(n, "license")}`;
     }
-
-    const productLines = purchase.lines.map((line) =>
-        line.kind === "dyha"
-            ? `${line.label} — ${count(line.licenses, "license")}`
-            : `${line.label} × ${line.units} — ${count(line.licenses, "license")}`
-    );
-    return { headline, productLines };
+    if (only && only.kind === "large_venue_kit") {
+        return only.units === 1 ? `Your Large Venue Kit includes ${count(n, "license")}` : `Your ${only.units} Large Venue Kits include ${count(n, "license")}`;
+    }
+    if (only && only.kind === "dyha") return `Your Discover Your Health Age purchase includes ${count(n, "license")}`;
+    return `Your purchases include ${count(n, "license")} in total`;
 }
 
-function buildModel(input: FreeYearEmailInput): Model {
-    assertValidPurchase(input.purchase);
-
-    const links = configuredStoreLinks(input);
-    for (const link of links) {
-        if (!isSafeHttpUrl(link.url)) throw new Error(`Refusing to build the email: the ${link.label} link is not a plain http(s) URL.`);
+/** The purchase as shown in the "Your Free Access" card: every line, never just one product. */
+function purchaseRowLines(purchase: PurchaseSummary): string[] {
+    if (purchase.lines.length === 1) {
+        const line = purchase.lines[0]!;
+        return [line.kind === "dyha" ? line.label : `${line.label} × ${line.units}`];
     }
-    if (!isSafeHttpUrl(ADMIN_PORTAL_URL)) throw new Error("Refusing to build the email: the Admin Portal URL is not a plain http(s) URL.");
+    return purchase.lines.map((line) =>
+        line.kind === "dyha" ? `${line.label} — ${count(line.licenses, "license")}` : `${line.label} × ${line.units} — ${count(line.licenses, "license")}`
+    );
+}
 
-    const n = input.purchase.licenses;
-    const extra = n - 1;
-    const { headline, productLines } = describePurchase(input.purchase);
-    const account = input.accountEmail;
-    const support: Segment = isMailbox(input.supportEmail) ? { mail: input.supportEmail } : input.supportEmail;
+/** "your Small Venue Kit purchase qualifies" / "your purchases qualify": one product reads naturally, several stay accurate. */
+function qualifyingPhrase(purchase: PurchaseSummary): string {
+    const only = purchase.lines.length === 1 ? purchase.lines[0] : undefined;
+    return only ? `your ${only.label} purchase qualifies` : "your purchases qualify";
+}
 
-    const notice =
-        extra === 0
+// ---------------------------------------------------------------------------
+// The documents
+// ---------------------------------------------------------------------------
+
+type Context = {
+    readonly input: FreeYearEmailInput;
+    readonly kind: EmailTemplateKind;
+    readonly n: number;
+    readonly extra: number;
+    readonly account: string;
+    readonly support: Segment;
+    readonly links: readonly StoreLink[];
+};
+
+const PLATFORM_BULLETS: readonly Rich[] = [["Android"], ["iOS (iPhone and iPad)"], ["Windows"], ["macOS"]];
+
+const forgotPasswordItem = (): Rich => ["Forgot your password? On the sign-in screen select ", bold("Forgot password?"), " and follow the steps to reset it."];
+
+function introBlocks(ctx: Context): Block[] {
+    const common: Rich[] = [
+        ["Thank you for being a Discover Your Health Age customer!"],
+        ["We’re excited to introduce the new and improved version of Discover Your Health Age, designed to give you a better experience with support across multiple platforms."],
+    ];
+    const grant: Rich =
+        ctx.kind === "existing_customer"
+            ? ["As part of this upgrade, we’re giving you 1 full year of FREE access to the new software."]
+            : [`As part of this upgrade, ${qualifyingPhrase(ctx.input.purchase)} you for 1 full year of FREE access to the new software.`];
+    // The discontinuation notice sits right after the introduction, above the access details, in every template.
+    const blocks: Block[] = [{ type: "paragraphs", paragraphs: [...common, grant] }, discontinuationNoticeBlock("purchaser")];
+
+    if (ctx.kind === "existing_customer") {
+        blocks.push(
+            { type: "heading", text: "What’s New?" },
+            { type: "paragraphs", paragraphs: [["The new Discover Your Health Age experience is now available across:"]] },
+            { type: "bullets", items: PLATFORM_BULLETS },
+            { type: "paragraphs", paragraphs: [["You can now access your HealthAge experience across these supported platforms."]] }
+        );
+    }
+    return blocks;
+}
+
+function accessBlocks(ctx: Context): Block[] {
+    const { input, kind, n, extra, account } = ctx;
+    const start = formatEmailDate(input.startDate);
+    const expiry = formatEmailDate(input.expiryDate);
+    const blocks: Block[] = [{ type: "heading", text: "Your Free Access" }];
+
+    if (extra > 0) {
+        // Workspace route: the owner manages the licenses.
+        blocks.push({
+            type: "details",
+            rows: [
+                { label: "Purchase", lines: purchaseRowLines(input.purchase) },
+                { label: "Licenses", lines: [count(n, "license")] },
+                { label: "Workspace Owner", lines: [account] },
+                { label: "Workspace", lines: [input.workspaceName] },
+                { label: "Start Date", lines: [start] },
+                { label: "Expiry Date", lines: [expiry] },
+            ],
+        });
+        blocks.push(
+            { type: "heading", text: `Your ${n} Licenses` },
+            { type: "paragraphs", paragraphs: [[`${describePurchase(input.purchase)}:`]] },
+            {
+                type: "bullets",
+                items: [["1 license for you as the workspace owner."], [`${count(extra, "additional license")} for your team members.`]],
+            },
+            {
+                type: "paragraphs",
+                paragraphs: [
+                    [`You can invite up to ${count(extra, "additional member")} through the HealthAge Admin Portal.`],
+                    [`No additional purchase or payment is required for your ${count(n, "license")}.`],
+                ],
+            },
+            { type: "button", label: "Open Admin Portal", url: ADMIN_PORTAL_URL, tone: "gold" }
+        );
+        return blocks;
+    }
+
+    if (kind === "existing_customer") {
+        blocks.push(
+            { type: "paragraphs", paragraphs: [["Your existing purchase qualifies you for one full year of free access to the new software."]] },
+            {
+                type: "details",
+                rows: [
+                    { label: "Access", lines: ["1 Year FREE"] },
+                    { label: "Start Date", lines: [start] },
+                    { label: "Expiry Date", lines: [expiry] },
+                    { label: "Registered Email", lines: [account] },
+                ],
+            }
+        );
+        return blocks;
+    }
+
+    // Small Venue Kit, one license.
+    blocks.push({
+        type: "details",
+        rows: [
+            { label: "Purchase", lines: purchaseRowLines(input.purchase) },
+            { label: "Licenses", lines: [count(n, "license")] },
+            { label: "Registered Email", lines: [account] },
+            { label: "Access Period", lines: ["1 Year FREE"] },
+            { label: "Start Date", lines: [start] },
+            { label: "Expiry Date", lines: [expiry] },
+        ],
+    });
+    blocks.push({
+        type: "paragraphs",
+        paragraphs: [
+            ["Your Small Venue Kit includes one license for your personal use."],
+            ["You do not need to access the Admin Portal or invite additional members."],
+        ],
+    });
+    return blocks;
+}
+
+/** One license: the purchaser uses the app directly. No Admin Portal, workspace or invitation instructions. */
+function directSteps(ctx: Context): Block[] {
+    const { kind, account, links } = ctx;
+    const download: Step = { title: "Download the New HealthAge App", body: [], downloads: links };
+
+    const signIn: Step =
+        kind === "existing_customer"
             ? {
-                  title: "One license, and it’s yours",
+                  title: "Sign In to Your HealthAge Account",
                   body: [
-                      "As the purchaser you are the workspace owner and you use this license yourself.",
-                      "No additional member seats are included with this purchase.",
+                      ["Already have a HealthAge account? You do not need to create a new one. Open the new app and sign in using your existing HealthAge email address and password."],
+                      ["Important: please use the same email address associated with your original purchase (", bold(account), "). Your free access is linked to this email address."],
+                  ],
+                  items: [
+                      forgotPasswordItem(),
+                      ["New to the HealthAge app? Select ", bold("Create Account"), " and register using that same email address."],
+                      ["If you already have an account, please do not create a second one."],
                   ],
               }
             : {
-                  title: `${count(n, "license")}: 1 for you and ${extra} for your team`,
-                  body: [
-                      `As the purchaser you are the workspace owner, and you use 1 of the ${n} licenses.`,
-                      `The other ${count(extra, "license")} can go to up to ${count(extra, "additional member")} you invite from the “Members” section of the Admin Portal. Each additional member signs in to the app with their own account.`,
+                  title: "Open the App and Sign In",
+                  body: [],
+                  items: [
+                      ["Already have a HealthAge account? Sign in using your existing email address and password."],
+                      ["New to HealthAge? Select ", bold("Create Account"), " and register using the same email address associated with your purchase (", bold(account), ")."],
+                      forgotPasswordItem(),
                   ],
               };
+
+    const start: Step =
+        kind === "existing_customer"
+            ? {
+                  title: "Start Using the New HealthAge App",
+                  body: [["Once you sign in, your one-year free access will be activated automatically."], ["No additional purchase or payment is required."]],
+              }
+            : {
+                  title: "Start Using HealthAge",
+                  body: [
+                      ["Your one-year free access will activate automatically once you sign in with your eligible purchase email."],
+                      ["No additional purchase or payment is required."],
+                  ],
+              };
+
+    return [{ type: "heading", text: "How to Switch to the New Version" }, { type: "steps", steps: [download, signIn, start] }];
+}
+
+/** Two or more licenses: the owner manages the workspace in the Admin Portal; members use the app. */
+function workspaceSteps(ctx: Context): Block[] {
+    const { input, n, extra, account, support, links } = ctx;
 
     const steps: Step[] = [
         {
@@ -230,356 +357,126 @@ function buildModel(input: FreeYearEmailInput): Model {
             body: [["Go to ", { link: ADMIN_PORTAL_URL }, ". This is the official HealthAge Admin Portal, where you manage your workspace."]],
         },
         {
-            title: "Create your account (first time only)",
+            title: "Sign In to Your Account",
             body: [
                 [
-                    "On the sign-in page, choose ",
-                    bold("Sign up"),
-                    ". Enter your full name, ",
+                    `Your workspace and ${count(n, "license")} are linked to your purchase email address, so always use `,
                     bold(account),
-                    " as the email, and a password of at least 8 characters, then select ",
+                    ". There is no approval step and nothing to wait for: as an eligible purchaser you can sign in as soon as your account is created.",
+                ],
+                ["If you see “Account not authorized”, or your workspace does not appear after you sign in, please contact us at ", support, "."],
+            ],
+            items: [
+                ["Already have a HealthAge account? Sign in using your existing email address and password."],
+                [
+                    "New to HealthAge? Select ",
+                    bold("Sign up"),
+                    ", enter your full name, ",
+                    bold(account),
+                    " as the email and a password of at least 8 characters, then select ",
                     bold("Create account"),
                     ".",
                 ],
-            ],
-            items: [
-                ["Use exactly ", bold(account), ", the email address used for your purchase. Your workspace and licenses are linked to it."],
                 ["The full-name field accepts letters, numbers and spaces, and must start with a letter."],
-                ["Already have a HealthAge account with this email? Skip this step and sign in."],
             ],
         },
         {
-            title: "Sign in",
+            title: "Open Your Workspace",
             body: [
-                ["Back on the sign-in page, sign in with ", bold(account), " and your password."],
-                [
-                    "There is no approval step and nothing to wait for: as an eligible purchaser you can sign in as soon as your account is created. Your workspace is already linked to the email address used for your purchase, so always sign in with ",
-                    bold(account),
-                    ".",
-                ],
-                [
-                    "If you see “Account not authorized”, or your workspace does not appear after you sign in, please contact us at ",
-                    support,
-                    ".",
-                ],
+                ["After signing in, go to ", bold("My Workspaces"), ". Your workspace is named ", bold(input.workspaceName), "."],
+                ["If more than one organization is listed, choose yours in the ", bold("Organization"), " list. Open your workspace to manage your licenses and team members."],
             ],
         },
         {
-            title: "Open your workspace",
+            title: "Check Your Licenses",
             body: [
-                ["After signing in you land on ", bold("My Workspaces"), ". Your workspace is called ", bold(input.workspaceName), "."],
-                ["If more than one organization is listed, choose yours in the ", bold("Organization"), " list."],
+                ["Open the ", bold("Manage Organization Members"), " section. At the start it reads ", bold(`1 of ${n} ${n === 1 ? "license" : "licenses"} used`), "."],
+                [`Your owner account uses one license, leaving ${count(extra, "license")} available for your team.`],
             ],
         },
         {
-            title: "Check your licenses",
-            body: [
-                [
-                    "The ",
-                    bold("Manage Organization Members"),
-                    " panel shows how many licenses are in use. At the start it reads ",
-                    bold(`1 of ${n} ${n === 1 ? "license" : "licenses"} used`),
-                    ": the one in use is yours.",
-                ],
+            title: "Invite Your Team Members",
+            body: [["Select ", bold("Members"), " from the menu. Under ", bold("Invite a Member"), ":"]],
+            items: [
+                ["Enter the member’s email address."],
+                ["Keep the role set to ", bold("member"), "."],
+                ["Select ", bold("Invite"), "."],
+                [`You can invite up to ${count(extra, "additional member")}: your ${n} licenses minus the one you use.`],
+                ["Active members and pending invitations both use a license, so the counter goes up as soon as you send an invitation."],
+                ["Each invited member receives an invitation email from HealthAge."],
+            ],
+        },
+        {
+            title: "Your Team Members Can Get Started",
+            body: [["Each invited member should:"]],
+            items: [
+                ["Open the invitation email from HealthAge. The invitation is tied to their email address, so there is nothing separate to accept."],
+                ["Download the new HealthAge app (links below)."],
+                ["Select ", bold("Create Account"), " in the app and register with the invited email address, or select ", bold("Sign In"), " if they already have an account."],
+                ["Their allocated license activates automatically. No additional purchase is required."],
             ],
         },
     ];
 
-    if (extra > 0) {
-        steps.push(
-            {
-                title: "Invite your additional members",
-                body: [
-                    [
-                        "Select ",
-                        bold("Members"),
-                        " in the menu. Under ",
-                        bold("Invite a Member"),
-                        ", enter the person’s email address, leave ",
-                        bold("Role"),
-                        " set to ",
-                        bold("member"),
-                        ", and select ",
-                        bold("Invite"),
-                        ".",
-                    ],
-                ],
-                items: [
-                    [`You can invite up to ${count(extra, "additional member")}: your ${n} licenses minus the one you use.`],
-                    ["Active members and pending invitations both use a license, so the counter goes up as soon as you send an invitation."],
-                    ["Each person you invite receives an invitation email from HealthAge."],
-                ],
-            },
-            {
-                title: "What each additional member does",
-                body: [["Each invited person installs the HealthAge app and signs in with their own account, using the email address you invited."]],
-                items: [
-                    ["New to HealthAge? On the sign-in screen choose ", bold("Create account"), " and register with the invited email address."],
-                    ["Already have an account? Just sign in with that email address."],
-                    ["Their license activates automatically. No purchase is needed in the app."],
-                ],
-            }
-        );
-    }
-
-    steps.push(
+    return [
+        { type: "heading", text: "How to Switch to the New Version" },
+        { type: "steps", steps },
+        { type: "heading", text: "Download the New HealthAge App" },
         {
-            title: "Download HealthAge",
-            body: [["Install the app on your device using the buttons below."]],
-            downloads: true,
+            type: "downloads",
+            intro: ["Install the app on your device and sign in with ", bold(account), ": your own license activates automatically."],
+            links,
         },
-        {
-            title: "Sign in to the app and start",
-            body: [
-                ["Open HealthAge and sign in with ", bold(account), " and the password you created."],
-                ["Your license applies automatically. No purchase or checkout is needed in the app."],
-            ],
-        }
-    );
-
-    const summary: Model["summary"] = [
-        { label: "Purchase", lines: productLines },
-        {
-            label: "Licenses",
-            lines: [extra === 0 ? "1 in total, used by you as the workspace owner" : `${n} in total (1 for you as the workspace owner, ${extra} for additional members)`],
-        },
-        { label: "Workspace owner", lines: [account] },
-        { label: "Workspace", lines: [input.workspaceName] },
-        { label: "Start Date", lines: [formatEmailDate(input.startDate)] },
-        { label: "Expires", lines: [formatEmailDate(input.expiryDate)] },
     ];
+}
+
+function helpLine(ctx: Context): Rich {
+    const lead =
+        ctx.extra > 0
+            ? "If you have any difficulty accessing your workspace or licenses, contact us at "
+            : ctx.kind === "existing_customer"
+              ? "If you have any difficulty accessing your free entitlement or signing in, contact us at "
+              : "If you need assistance, contact us at ";
+    return [lead, ctx.support, "."];
+}
+
+function buildDocument(input: FreeYearEmailInput): EmailDocument {
+    assertValidPurchase(input.purchase);
+
+    const links = configuredStoreLinks(input);
+    if (!isSafeHttpUrl(ADMIN_PORTAL_URL)) throw new Error("Refusing to build the email: the Admin Portal URL is not a plain http(s) URL.");
+
+    const n = input.purchase.licenses;
+    const ctx: Context = {
+        input,
+        kind: selectEmailTemplate(input.purchase),
+        n,
+        extra: n - 1,
+        account: input.accountEmail,
+        support: isMailbox(input.supportEmail) ? { mail: input.supportEmail } : input.supportEmail,
+        links,
+    };
+
+    const blocks: Block[] = [...introBlocks(ctx), ...accessBlocks(ctx), ...(ctx.extra > 0 ? workspaceSteps(ctx) : directSteps(ctx))];
 
     return {
-        subject: FREE_YEAR_EMAIL_SUBJECT,
-        preheader: `${headline} Here is how to get started.`,
+        subject: EMAIL_SUBJECTS[ctx.kind],
+        preheader: `1 full year of FREE access to the new Discover Your Health Age app. ${describePurchase(input.purchase)}. Here is how to switch.`,
+        title: "Your New HealthAge Experience Is Ready!",
         greeting: `Hi ${input.customerName},`,
-        intro: [
-            "Great news — the new Discover Your Health Age App is ready!",
-            "Thank you for purchasing the app in 2026. We’ve been working hard to make the Discover Your Health Age experience even better.",
-            "As part of the upgrade, you’re receiving 1 full year of FREE access to the new app.",
-        ],
-        headline,
-        summary,
-        notice,
-        portalUrl: ADMIN_PORTAL_URL,
-        steps,
-        downloads: links,
-        availableOn: links.map((link) => link.label).join(" • "),
-        help: ["Need help? Contact us at ", support, "."],
+        blocks,
+        help: helpLine(ctx),
         closing: [
             "Thank you for being part of the Discover Your Health Age community.",
-            "We’re excited for you to experience the new app!",
+            ctx.extra > 0 ? "We’re excited for you and your team to experience the new HealthAge!" : "We’re excited for you to experience the new HealthAge!",
         ],
-        signOff: "- Pastor Rodney Bowes",
-        recipientNote: `This message was sent to ${account} because of your 2026 Discover Your Health Age purchase.`,
+        signOff: ["Warm regards,", "Pastor Rodney Bowes", "HealthAge Support Team", "Discover Your Health Age"],
+        recipientNote: `This message was sent to ${input.accountEmail} because of your Discover Your Health Age purchase.`,
     };
-}
-
-// ---------------------------------------------------------------------------
-// Plain-text renderer
-// ---------------------------------------------------------------------------
-
-function richText(rich: Rich): string {
-    return rich
-        .map((segment) => {
-            if (typeof segment === "string") return segment;
-            if ("b" in segment) return `“${segment.b}”`;
-            if ("link" in segment) return segment.link;
-            return segment.mail;
-        })
-        .join("");
-}
-
-function renderText(model: Model): string {
-    const lines: string[] = [];
-    const blank = () => lines.push("");
-
-    lines.push(model.greeting, "");
-    for (const paragraph of model.intro) lines.push(paragraph, "");
-    lines.push(model.headline, "");
-
-    lines.push("YOUR ACCESS");
-    for (const row of model.summary) {
-        const [first = "", ...rest] = row.lines;
-        lines.push(`${row.label}: ${first}`);
-        for (const extraLine of rest) lines.push(`${" ".repeat(row.label.length + 2)}${extraLine}`);
-    }
-    blank();
-
-    lines.push(model.notice.title);
-    for (const paragraph of model.notice.body) lines.push(paragraph);
-    blank();
-
-    lines.push("HOW TO GET STARTED", `Open the HealthAge Admin Portal: ${model.portalUrl}`, "");
-    model.steps.forEach((step, index) => {
-        const number = `${index + 1}. `;
-        const pad = " ".repeat(number.length);
-        lines.push(`${number}${step.title}`);
-        for (const paragraph of step.body) lines.push(`${pad}${richText(paragraph)}`);
-        for (const item of step.items ?? []) lines.push(`${pad}- ${richText(item)}`);
-        if (step.downloads) {
-            if (model.availableOn) lines.push(`${pad}Available on: ${model.availableOn}`);
-            for (const link of model.downloads) lines.push(`${pad}${link.label}: ${link.url}`);
-        }
-        blank();
-    });
-
-    lines.push(richText(model.help), "");
-    for (const paragraph of model.closing) lines.push(paragraph);
-    blank();
-    lines.push(model.signOff);
-    return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// HTML renderer: tables + inline CSS only. No <style>, no scripts, no images, no external files.
-// ---------------------------------------------------------------------------
-
-const COLOR = {
-    navy: "#0B2545",
-    navySoft: "#13315C",
-    gold: "#C9A227",
-    goldSoft: "#FBF6E6",
-    ink: "#1F2A44",
-    muted: "#5B6577",
-    line: "#E3E7EF",
-    page: "#F3F5F9",
-    white: "#FFFFFF",
-} as const;
-
-const SANS = "Arial, Helvetica, sans-serif";
-const SERIF = "Georgia, 'Times New Roman', serif";
-/** Lets long URLs and e-mail addresses wrap on a narrow phone instead of forcing the layout wider. */
-const WRAP = "word-break:break-word;overflow-wrap:anywhere;";
-
-function esc(value: string): string {
-    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
-function richHtml(rich: Rich): string {
-    return rich
-        .map((segment) => {
-            if (typeof segment === "string") return esc(segment);
-            if ("b" in segment) return `<strong style="color:${COLOR.navy};">${esc(segment.b)}</strong>`;
-            if ("link" in segment) {
-                return `<a href="${esc(segment.link)}" target="_blank" rel="noopener" style="color:${COLOR.navySoft};text-decoration:underline;${WRAP}">${esc(segment.link)}</a>`;
-            }
-            return `<a href="mailto:${esc(segment.mail)}" style="color:${COLOR.navySoft};text-decoration:underline;${WRAP}">${esc(segment.mail)}</a>`;
-        })
-        .join("");
-}
-
-const paragraphHtml = (inner: string, extraStyle = ""): string =>
-    `<p style="margin:0 0 12px 0;font-family:${SANS};font-size:15px;line-height:23px;color:${COLOR.ink};${WRAP}${extraStyle}">${inner}</p>`;
-
-function buttonHtml(label: string, url: string, tone: "gold" | "navy"): string {
-    const background = tone === "gold" ? COLOR.gold : COLOR.navy;
-    const foreground = tone === "gold" ? COLOR.navy : COLOR.white;
-    return (
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" width="100%" style="width:100%;max-width:320px;margin:0 auto;">` +
-        `<tr><td align="center" bgcolor="${background}" style="background-color:${background};border-radius:6px;padding:14px 20px;">` +
-        `<a href="${esc(url)}" target="_blank" rel="noopener" style="display:block;font-family:${SANS};font-size:16px;line-height:20px;font-weight:bold;color:${foreground};text-decoration:none;">${esc(label)}</a>` +
-        `</td></tr></table>`
-    );
-}
-
-function stepHtml(step: Step, number: number, downloads: readonly StoreLink[], availableOn: string): string {
-    const body = step.body.map((paragraph) => paragraphHtml(richHtml(paragraph), "margin-bottom:8px;")).join("");
-    const items = step.items?.length
-        ? `<ul style="margin:0 0 8px 0;padding:0 0 0 20px;">${step.items
-              .map((item) => `<li style="font-family:${SANS};font-size:14px;line-height:21px;color:${COLOR.muted};margin:0 0 4px 0;${WRAP}">${richHtml(item)}</li>`)
-              .join("")}</ul>`
-        : "";
-    const buttons = step.downloads
-        ? `<p style="margin:4px 0 12px 0;font-family:${SANS};font-size:13px;line-height:19px;color:${COLOR.muted};">${availableOn ? `Available on: ${esc(availableOn)}` : ""}</p>` +
-          downloads
-              .map((link) => `<div style="padding:0 0 10px 0;">${buttonHtml(`Download for ${link.label}`, link.url, "navy")}</div>`)
-              .join("")
-        : "";
-
-    return (
-        `<tr><td style="padding:0 0 18px 0;">` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"><tr>` +
-        `<td width="44" valign="top" style="width:44px;min-width:44px;padding:0;">` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" valign="middle" bgcolor="${COLOR.gold}" style="background-color:${COLOR.gold};border-radius:15px;width:30px;height:30px;font-family:${SANS};font-size:15px;line-height:30px;font-weight:bold;color:${COLOR.navy};">${number}</td></tr></table>` +
-        `</td>` +
-        `<td valign="top" style="padding:0;">` +
-        `<h3 style="margin:2px 0 8px 0;font-family:${SANS};font-size:16px;line-height:22px;color:${COLOR.navy};">${esc(step.title)}</h3>` +
-        body +
-        items +
-        buttons +
-        `</td></tr></table></td></tr>`
-    );
-}
-
-function renderHtml(model: Model): string {
-    const summaryRows = model.summary
-        .map(
-            (row, index) =>
-                `<tr><td valign="top" style="padding:9px 12px 9px 0;${index > 0 ? `border-top:1px solid ${COLOR.line};` : ""}font-family:${SANS};font-size:13px;line-height:19px;color:${COLOR.muted};width:34%;">${esc(row.label)}</td>` +
-                `<td valign="top" style="padding:9px 0;${index > 0 ? `border-top:1px solid ${COLOR.line};` : ""}font-family:${SANS};font-size:14px;line-height:20px;font-weight:bold;color:${COLOR.navy};${WRAP}">${row.lines.map(esc).join("<br>")}</td></tr>`
-        )
-        .join("");
-
-    const steps = model.steps.map((step, index) => stepHtml(step, index + 1, model.downloads, model.availableOn)).join("");
-
-    return (
-        `<!DOCTYPE html>` +
-        `<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
-        `<meta name="x-apple-disable-message-reformatting"><meta name="color-scheme" content="light only"><meta name="supported-color-schemes" content="light">` +
-        `<title>${esc(model.subject)}</title></head>` +
-        `<body style="margin:0;padding:0;background-color:${COLOR.page};">` +
-        `<div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;font-size:1px;line-height:1px;color:${COLOR.page};">${esc(model.preheader)}</div>` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="${COLOR.page}" style="background-color:${COLOR.page};"><tr><td align="center" style="padding:20px 10px;">` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="width:100%;max-width:600px;">` +
-        // ---- header band
-        `<tr><td bgcolor="${COLOR.navy}" style="background-color:${COLOR.navy};padding:22px 28px 18px 28px;border-radius:10px 10px 0 0;">` +
-        `<div style="font-family:${SERIF};font-size:26px;line-height:30px;font-weight:bold;letter-spacing:0.5px;color:${COLOR.white};">HealthAge</div>` +
-        `<div style="font-family:${SANS};font-size:11px;line-height:16px;letter-spacing:2px;text-transform:uppercase;color:${COLOR.gold};padding-top:2px;">Discover Your Health Age</div>` +
-        `</td></tr>` +
-        `<tr><td height="4" bgcolor="${COLOR.gold}" style="background-color:${COLOR.gold};height:4px;font-size:0;line-height:0;">&nbsp;</td></tr>` +
-        // ---- body
-        `<tr><td bgcolor="${COLOR.white}" style="background-color:${COLOR.white};padding:30px 28px 8px 28px;">` +
-        `<h1 style="margin:0 0 14px 0;font-family:${SERIF};font-size:27px;line-height:33px;color:${COLOR.navy};">Welcome to the new Discover Your Health Age App</h1>` +
-        paragraphHtml(esc(model.greeting), "font-size:16px;") +
-        model.intro.map((paragraph) => paragraphHtml(esc(paragraph))).join("") +
-        // ---- personalised summary
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 6px 0;"><tr>` +
-        `<td bgcolor="${COLOR.goldSoft}" style="background-color:${COLOR.goldSoft};border-left:4px solid ${COLOR.gold};border-radius:6px;padding:16px 18px;">` +
-        `<div style="font-family:${SERIF};font-size:19px;line-height:25px;color:${COLOR.navy};padding-bottom:4px;">${esc(model.headline)}</div>` +
-        `<div style="font-family:${SANS};font-size:11px;line-height:16px;letter-spacing:1.5px;text-transform:uppercase;color:${COLOR.muted};padding:6px 0 4px 0;">Your access</div>` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">${summaryRows}</table>` +
-        `</td></tr></table>` +
-        // ---- license note (single license / owner + team)
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:14px 0 6px 0;"><tr>` +
-        `<td style="border:1px solid ${COLOR.line};border-radius:6px;padding:14px 18px;">` +
-        `<div style="font-family:${SANS};font-size:15px;line-height:21px;font-weight:bold;color:${COLOR.navy};padding-bottom:6px;">${esc(model.notice.title)}</div>` +
-        model.notice.body.map((paragraph) => paragraphHtml(esc(paragraph), "margin-bottom:6px;font-size:14px;line-height:21px;")).join("") +
-        `</td></tr></table>` +
-        // ---- primary call to action
-        `<div style="padding:22px 0 6px 0;text-align:center;">${buttonHtml("Open Admin Portal", model.portalUrl, "gold")}` +
-        `<p style="margin:10px 0 0 0;font-family:${SANS};font-size:12px;line-height:18px;color:${COLOR.muted};">Or copy this link: ${richHtml([{ link: model.portalUrl }])}</p></div>` +
-        // ---- steps
-        `<h2 style="margin:22px 0 14px 0;padding-top:18px;border-top:1px solid ${COLOR.line};font-family:${SERIF};font-size:21px;line-height:27px;color:${COLOR.navy};">How to get started</h2>` +
-        `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">${steps}</table>` +
-        // ---- help + sign-off
-        `<div style="border-top:1px solid ${COLOR.line};padding-top:16px;margin-top:4px;">` +
-        paragraphHtml(richHtml(model.help)) +
-        model.closing.map((paragraph) => paragraphHtml(esc(paragraph))).join("") +
-        paragraphHtml(esc(model.signOff), "margin-top:14px;font-style:italic;color:" + COLOR.navy + ";") +
-        `</div></td></tr>` +
-        // ---- footer
-        `<tr><td bgcolor="${COLOR.navy}" style="background-color:${COLOR.navy};padding:18px 28px;border-radius:0 0 10px 10px;">` +
-        `<div style="font-family:${SANS};font-size:12px;line-height:18px;color:#C9D3E3;">${esc(model.recipientNote)}</div>` +
-        `<div style="font-family:${SANS};font-size:11px;line-height:16px;letter-spacing:1.5px;text-transform:uppercase;color:${COLOR.gold};padding-top:8px;">HealthAge · Discover Your Health Age</div>` +
-        `</td></tr>` +
-        `</table></td></tr></table></body></html>`
-    );
 }
 
 // ---------------------------------------------------------------------------
 
 export function getLegacyFreeYearEmailContent(input: FreeYearEmailInput): FreeYearEmailContent {
-    const model = buildModel(input);
-    return { subject: model.subject, text: renderText(model), html: renderHtml(model) };
+    return renderEmailDocument(buildDocument(input));
 }

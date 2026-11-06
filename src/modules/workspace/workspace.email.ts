@@ -1,7 +1,13 @@
+import { eq } from "drizzle-orm";
+import type { FastifyInstance } from "fastify";
 import nodemailer from "nodemailer";
 
 import { env } from "@config/env";
-import { WORKSPACE_ADMIN_URL } from "./workspace.links";
+import { users } from "@db/schema";
+import { buildWorkspaceInviteEmail, type WorkspaceInviteEmailInput } from "./workspace.invite-template";
+
+export type { WorkspaceInviteEmailInput } from "./workspace.invite-template";
+export { isLegacyMigrationWorkspace } from "./workspace.invite-template";
 
 export function inferWorkspaceDisplayName(email: string, explicitName?: string | null): string {
     if (explicitName && explicitName.trim().length > 0) return explicitName.trim();
@@ -9,49 +15,39 @@ export function inferWorkspaceDisplayName(email: string, explicitName?: string |
     return localPart || "User";
 }
 
-export function getWorkspaceInviteEmailContent(input: {
-    organizationName: string;
-    userName: string;
-    userEmail: string;
-    isOwner?: boolean;
-    subject?: string;
-}) {
-    const isOwner = input.isOwner ?? false;
-    const subject =
-        input.subject ??
-        (isOwner
-            ? `You’ve Been Added as Workspace Admin to ${input.organizationName}’s “Discover your health age” App Pro Account`
-            : `You’ve Been Added to ${input.organizationName}’s “Discover your health age” App’s Pro Account`);
+/**
+ * The single builder for workspace invitation and owner-welcome emails. The design and wording live in
+ * `workspace.invite-template.ts`; this adds the per-environment values: the store links and the support
+ * address (HEALTHAGE_*_URL, HEALTHAGE_SUPPORT_EMAIL; unset means the published defaults).
+ */
+export function getWorkspaceInviteEmailContent(input: WorkspaceInviteEmailInput) {
+    return buildWorkspaceInviteEmail({
+        ...input,
+        storeUrls: {
+            android: env.HEALTHAGE_ANDROID_URL,
+            ios: env.HEALTHAGE_IOS_URL,
+            windows: env.HEALTHAGE_WINDOWS_URL,
+            macos: env.HEALTHAGE_MACOS_URL,
+            ...input.storeUrls,
+        },
+        supportEmail: input.supportEmail ?? env.HEALTHAGE_SUPPORT_EMAIL,
+    });
+}
 
-    const introRoleLine = isOwner
-        ? "You have been added as the workspace administrator for your organization."
-        : "Your organization administrator has granted you access to premium features as part of your organization’s subscription.";
-
-    const text = `Hello ${input.userName},
-
-You’ve been added to the Pro account for ${input.organizationName} on “Discover your health age” App.
-${introRoleLine}
-
-To get started:
-1. Visit: ${WORKSPACE_ADMIN_URL}
-2. Download the app for your device (iPhone, Android, Windows, or Mac)
-3. Sign in using this email address: ${input.userEmail}
-4. If you don’t already have an account, create one using this email address
-5. Your Pro access will automatically be activated after login`;
-
-    const html = `<p>Hello ${input.userName},</p>
-<p>You’ve been added to the Pro account for <strong>${input.organizationName}</strong> on “Discover your health age” App.</p>
-<p>${introRoleLine}</p>
-<p>To get started:</p>
-<ol>
-<li>Visit: <a href="${WORKSPACE_ADMIN_URL}">${WORKSPACE_ADMIN_URL}</a></li>
-<li>Download the app for your device (iPhone, Android, Windows, or Mac)</li>
-<li>Sign in using this email address: <strong>${input.userEmail}</strong></li>
-<li>If you don’t already have an account, create one using this email address</li>
-<li>Your Pro access will automatically be activated after login</li>
-</ol>`;
-
-    return { subject, text, html };
+/**
+ * The display name of the person sending an invitation, for the email ("Pat has invited you...").
+ * Best effort: the invitation is already saved, so a failed lookup just means the email says
+ * "Your workspace administrator" instead. It never throws.
+ */
+export async function findInviterDisplayName(app: FastifyInstance, userId: string | undefined): Promise<string | null> {
+    if (!userId) return null;
+    try {
+        const [row] = await app.db.select({ name: users.name }).from(users).where(eq(users.id, userId)).limit(1);
+        const name = row?.name?.trim();
+        return name ? name : null;
+    } catch {
+        return null;
+    }
 }
 
 export function createWorkspaceSmtpTransport() {

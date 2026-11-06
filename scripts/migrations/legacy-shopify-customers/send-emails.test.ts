@@ -42,7 +42,7 @@ import {
     type SmtpTransportConfig,
     type TransportDeps,
 } from "./email-transport.ts";
-import { getLegacyFreeYearEmailContent, type PurchaseSummary } from "./migration-email.ts";
+import { EMAIL_SUBJECTS, emailSubjectFor, getLegacyFreeYearEmailContent, type PurchaseSummary } from "./migration-email.ts";
 import { parseOrdersCsvText, readOrdersCsv } from "./orders-csv.ts";
 import { ELIGIBLE_PRODUCTS } from "./product-eligibility.ts";
 import { buildPurchaseIndex } from "./purchase-summary.ts";
@@ -1145,7 +1145,7 @@ describe("stage 2 mail transport (no real SMTP)", () => {
         const approved = getLegacyFreeYearEmailContent({ ...baseRequest() });
         assert.equal(message.from, "HealthAge <noreply@test.invalid>");
         assert.equal(message.to, "ann@example.com");
-        assert.equal(message.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
+        assert.equal(message.subject, EMAIL_SUBJECTS.existing_customer);
         assert.equal(message.text, approved.text);
         assert.equal(message.html, approved.html);
         assert.deepEqual(config, { host: "smtp.test.invalid", port: 587, secure: false, auth: { user: "smtp-user", pass: "smtp-pass" } });
@@ -2206,7 +2206,7 @@ describe("stage 2 exact recipient targeting (--only-emails)", () => {
             macosUrl: FULL_CONFIG.macosUrl,
             supportEmail: FULL_CONFIG.supportEmail!,
         });
-        assert.equal(message.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
+        assert.equal(message.subject, emailSubjectFor(request.purchase));
         assert.equal(message.text, approved.text);
         assert.equal(message.html, approved.html);
         for (const url of [FULL_CONFIG.androidUrl, FULL_CONFIG.windowsUrl, FULL_CONFIG.iosUrl, FULL_CONFIG.macosUrl]) {
@@ -2426,17 +2426,19 @@ describe("sample email mode (--sample): content and delivery", () => {
             macosUrl: FULL_CONFIG.macosUrl,
             supportEmail: FULL_CONFIG.supportEmail!,
         });
-        assert.equal(content.subject, "Your 1 year of FREE access to the new Discover Your Health Age App");
+        assert.equal(content.subject, EMAIL_SUBJECTS.large_venue_kit);
         assert.equal(content.text, approved.text);
         assert.equal(content.html, approved.html);
 
         assert.equal(SAMPLE_CUSTOMER_NAME, "HealthAge Test Customer");
         assert.match(content.text, /^Hi HealthAge Test Customer,/);
         assert.match(content.text, /Start Date: 2026-01-01 \(sample date\)/);
-        assert.match(content.text, /Expires: 2027-01-01 \(sample date\)/);
-        // In the HTML the label and the value sit in separate table cells.
-        assert.match(content.html, />Start Date<\/td>/);
-        assert.match(content.html, />2026-01-01 \(sample date\)<\/td>/);
+        assert.match(content.text, /Expiry Date: 2027-01-01 \(sample date\)/);
+        assert.ok(content.text.includes("Important: Discontinuation of the Previous HealthAge Software"), "the sample carries the discontinuation notice");
+        assert.ok(content.html.includes("Important: Discontinuation of the Previous HealthAge Software"));
+        // In the HTML the label and the value are separate boxes of the details card.
+        assert.match(content.html, />Start Date<\/div>/);
+        assert.match(content.html, />2026-01-01 \(sample date\)<\/div>/);
         assert.match(SAMPLE_START_DATE + SAMPLE_EXPIRY_DATE, /sample date.*sample date/);
     });
 
@@ -2805,6 +2807,25 @@ function runCli(cwd: string, env: NodeJS.ProcessEnv, args: string[]): Promise<{ 
     });
 }
 
+/** Decodes RFC 2047 encoded words (`=?UTF-8?Q?...?=`), which the mailer uses for a header with a non-ASCII character such as the en dash in a subject. */
+function decodeMimeWords(value: string): string {
+    return value
+        .replace(/(=\?UTF-8\?[QB]\?[^?]*\?=)\s+(?==\?UTF-8\?[QB]\?)/gi, "$1")
+        .replace(/=\?UTF-8\?([QB])\?([^?]*)\?=/gi, (_match, kind: string, data: string) => {
+            if (/^b$/i.test(kind)) return Buffer.from(data, "base64").toString("utf8");
+            const text = data.replace(/_/g, " ");
+            const bytes: number[] = [];
+            for (let i = 0; i < text.length; i++) {
+                const hex = text.slice(i + 1, i + 3);
+                if (text[i] === "=" && /^[0-9A-Fa-f]{2}$/.test(hex)) {
+                    bytes.push(parseInt(hex, 16));
+                    i += 2;
+                } else bytes.push(text.charCodeAt(i));
+            }
+            return Buffer.from(bytes).toString("utf8");
+        });
+}
+
 /** Decodes the text/plain and text/html parts of a captured message. */
 function decodeMessage(raw: string): { headers: Record<string, string>; text: string; html: string } {
     const split = (value: string): [string, string] => {
@@ -2815,7 +2836,7 @@ function decodeMessage(raw: string): { headers: Record<string, string>; text: st
         const headers: Record<string, string> = {};
         for (const line of block.replace(/\r\n[ \t]+/g, " ").split("\r\n")) {
             const colon = line.indexOf(":");
-            if (colon > 0) headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+            if (colon > 0) headers[line.slice(0, colon).toLowerCase()] = decodeMimeWords(line.slice(colon + 1).trim());
         }
         return headers;
     };
@@ -2898,8 +2919,9 @@ describe("sample email mode (--sample): the real CLI against loopback traps", ()
             assert.match(result.stdout, /SAMPLE PREVIEW — nothing is sent/);
             assert.match(result.stdout, /No email was sent/);
             assert.ok(result.stdout.includes(`${SAMPLE_ONE}, ${SAMPLE_TWO}`));
-            assert.ok(result.stdout.includes("Subject: Your 1 year of FREE access to the new Discover Your Health Age App"));
+            assert.ok(result.stdout.includes(`Subject: ${EMAIL_SUBJECTS.large_venue_kit}`), "the default sample is the Large Venue Kit email");
             assert.match(result.stdout, /Hi HealthAge Test Customer,/);
+            assert.match(result.stdout, /Important: Discontinuation of the Previous HealthAge Software/, "the sample preview shows the notice too");
             assert.match(result.stdout, /Start Date: 2026-01-01 \(sample date\)/);
             for (const url of FOUR_LINKS) {
                 assert.ok(result.stdout.includes(url), `preview must show ${url}`);
@@ -2942,24 +2964,33 @@ describe("sample email mode (--sample): the real CLI against loopback traps", ()
         });
     });
 
-    it("SAMPLE SEND with one link missing is refused before the mail server is contacted", async () => {
+    it("SAMPLE SEND with an unusable link is refused before the mail server is contacted", async () => {
         await withTraps(async ({ cwd, smtp, db, env }) => {
             const environment = env();
-            delete environment.HEALTHAGE_IOS_URL;
+            environment.HEALTHAGE_IOS_URL = "javascript:alert(1)";
             const result = await runCli(cwd, environment, ["--sample", "--send-sample", `--test-recipients=${SAMPLE_PAIR}`]);
 
             assert.equal(result.code, 1);
-            assert.match(result.stderr, /Sample send refused: HEALTHAGE_IOS_URL is not set/);
-            assert.match(result.stderr, /a sample must show all four platform links/, "the CLI's own, explanatory refusal");
+            assert.match(result.stderr + result.stdout, /HEALTHAGE_IOS_URL is not a plain http\(s\) URL/);
+            assert.equal(smtp.connections, 0, "the mail server is never contacted");
+            assert.equal(db.attempts(), 0);
+            assert.deepEqual(smtp.rcpts, []);
+        });
+    });
+
+    it("an unset platform link falls back to the published listing, so a sample still shows all four platforms", async () => {
+        await withTraps(async ({ cwd, smtp, db, env }) => {
+            const environment = env();
+            delete environment.HEALTHAGE_IOS_URL;
+            delete environment.HEALTHAGE_MACOS_URL;
+            const preview = await runCli(cwd, environment, ["--sample", `--test-recipients=${SAMPLE_PAIR}`]);
+
+            assert.equal(preview.code, 0, `stdout:\n${preview.stdout}\nstderr:\n${preview.stderr}`);
+            assert.ok(preview.stdout.includes("https://apps.apple.com/in/app/health-age/id6744716742"), "the published iOS listing");
+            assert.ok(preview.stdout.includes("https://healthage.healthexporesources.com/download/"), "the published macOS download page");
+            assert.doesNotMatch(preview.stdout, /NOT SET|WOULD BE REFUSED/);
             assert.equal(smtp.connections, 0);
             assert.equal(db.attempts(), 0);
-
-            // The preview of the same thing still works and says what is wrong.
-            const preview = await runCli(cwd, environment, ["--sample", `--test-recipients=${SAMPLE_PAIR}`]);
-            assert.equal(preview.code, 0);
-            assert.match(preview.stdout, /iOS\s+NOT SET/);
-            assert.match(preview.stdout, /A SAMPLE SEND WOULD BE REFUSED: HEALTHAGE_IOS_URL is not set/);
-            assert.equal(smtp.connections, 0);
         });
     });
 
@@ -3021,34 +3052,62 @@ describe("stage 2 sends each customer the email for what they actually bought", 
         const run = await runStage({ args: ["--send", "--all"], db, log, context: contextFor() });
         assert.equal(emailRunExitCode(run.outcomes), 0);
 
-        const expected: Record<string, RegExp> = {
-            "pilot.large@example.com": /Your Large Venue Kit includes 4 licenses\./,
-            "pilot.small@example.com": /Your Small Venue Kit includes 1 license\./,
-            "pilot.large+extra@example.com": /Your Discover Your Health Age purchase includes 3 licenses\./,
-            "other.large@example.com": /Your 2 Large Venue Kits include 8 licenses\./,
-            "other.dyha@example.com": /Your Discover Your Health Age purchase includes 2 licenses\./,
+        // Each customer's email: the template for their product, and the license sentence for their real count.
+        const expected: Record<string, { subject: string; licenses: RegExp }> = {
+            "pilot.large@example.com": { subject: EMAIL_SUBJECTS.large_venue_kit, licenses: /Your Large Venue Kit includes 4 licenses:/ },
+            "pilot.small@example.com": { subject: EMAIL_SUBJECTS.small_venue_kit, licenses: /Your Small Venue Kit includes one license for your personal use\./ },
+            "pilot.large+extra@example.com": { subject: EMAIL_SUBJECTS.existing_customer, licenses: /Your Discover Your Health Age purchase includes 3 licenses:/ },
+            "other.large@example.com": { subject: EMAIL_SUBJECTS.large_venue_kit, licenses: /Your 2 Large Venue Kits include 8 licenses:/ },
+            "other.dyha@example.com": { subject: EMAIL_SUBJECTS.existing_customer, licenses: /Your Discover Your Health Age purchase includes 2 licenses:/ },
         };
         assert.deepEqual([...log.recipients()].sort(), Object.keys(expected).sort());
 
-        for (const entry of log.sent) {
+        const messages = log.sent.map((entry) => ({ entry, message: buildFreeYearMessage(entry.request, "from@test.invalid", entry.headers) }));
+        for (const { entry, message } of messages) {
             const email = entry.request.to;
             const workspace = store.workspaces.find((candidate) => candidate.owner_email === email)!;
             const plan = PILOT_PLAN.customers.find((customer) => customer.email === email)!;
-            const message = buildFreeYearMessage(entry.request, "from@test.invalid", entry.headers);
+            const n = workspace.seat_limit;
 
             // One number, three sources, all equal: the email, the workspace, the plan.
-            assert.equal(entry.request.purchase.licenses, workspace.seat_limit, `${email}: email vs workspace`);
+            assert.equal(entry.request.purchase.licenses, n, `${email}: email vs workspace`);
             assert.equal(entry.request.purchase.licenses, plan.licenseQuantity, `${email}: email vs plan`);
-            assert.ok(message.text.includes(`“1 of ${workspace.seat_limit} ${workspace.seat_limit === 1 ? "license" : "licenses"} used”`), email);
-            assert.match(message.text, expected[email]!, email);
-            assert.ok(message.text.includes(`Your workspace is called “${workspace.name}”`), email);
-            assert.ok(message.text.includes(`Use exactly “${email}”`), email);
+
+            // The product decides the template (and its subject); the license count decides the route.
+            assert.equal(message.subject, expected[email]!.subject, `${email}: template`);
+            assert.equal(message.subject, emailSubjectFor(entry.request.purchase), `${email}: subject follows the purchase`);
+            assert.match(message.text, expected[email]!.licenses, email);
+            // The discontinuation notice reaches every recipient, in the text and the HTML, exactly once.
+            assert.equal(message.text.split("Important: Discontinuation of the Previous HealthAge Software").length - 1, 1, `${email}: notice in the text`);
+            assert.equal(message.html.split("Important: Discontinuation of the Previous HealthAge Software").length - 1, 1, `${email}: notice in the HTML`);
+            assert.ok(message.text.includes("The old software will no longer be supported."), `${email}: notice wording`);
             assert.ok(message.html.includes(`href="${FULL_CONFIG.iosUrl}"`));
             assert.doesNotMatch(message.text + message.html, /sample date|HealthAge Test Customer|test\.customer@example\.com/i);
 
-            // Members are only mentioned for customers who have licenses to give.
-            const extra = workspace.seat_limit - 1;
-            assert.equal(/Invite a Member/.test(message.text), extra > 0, `${email}: member steps iff more than 1 license`);
+            if (n === 1) {
+                // One license: straight to the app. No Admin Portal, workspace or member instructions.
+                assert.doesNotMatch(message.text, /Admin Portal: |Open the HealthAge Admin Portal|My Workspaces|Invite a Member|Manage Organization Members/, `${email}: direct route`);
+                assert.ok(message.text.includes(`(“${email}”)`), `${email}: told to use the purchase address`);
+            } else {
+                // More than one license: the owner manages the workspace.
+                assert.ok(message.text.includes(`“1 of ${n} licenses used”`), email);
+                assert.ok(message.text.includes(`Your workspace is named “${workspace.name}”`), email);
+                assert.ok(message.text.includes(`always use “${email}”`), email);
+                assert.match(message.text, /Open the HealthAge Admin Portal/);
+                assert.match(message.text, /Invite a Member/, `${email}: member steps when there are licenses to give`);
+            }
+        }
+
+        // No customer data leaks into another customer's message.
+        for (const { entry, message } of messages) {
+            for (const other of messages.filter((candidate) => candidate.entry.request.to !== entry.request.to)) {
+                const otherEmail = other.entry.request.accountEmail;
+                const otherWorkspace = other.entry.request.workspaceName;
+                for (const body of [message.text, message.html]) {
+                    assert.equal(body.includes(otherEmail), false, `${entry.request.to}'s message contains ${otherEmail}`);
+                    if (otherWorkspace !== entry.request.workspaceName) assert.equal(body.includes(`“${otherWorkspace}”`), false, `${entry.request.to}'s message names ${otherWorkspace}`);
+                }
+            }
         }
     });
 
@@ -3134,7 +3193,9 @@ describe("stage 2 sends each customer the email for what they actually bought", 
         assert.equal(payload.workspaceName, "Pilot Large");
         assert.equal(payload.purchase.licenses, 4);
         assert.equal(payload.purchase.licenses, store.workspaces[0]!.seat_limit);
-        assert.match(getLegacyFreeYearEmailContent(payload).text, /Your Large Venue Kit includes 4 licenses\./);
+        const content = getLegacyFreeYearEmailContent(payload);
+        assert.equal(content.subject, EMAIL_SUBJECTS.large_venue_kit, "the Stage 1 inline email uses the same template as Stage 2");
+        assert.match(content.text, /Your Large Venue Kit includes 4 licenses:/);
     });
 });
 
@@ -3165,17 +3226,26 @@ describe("sample mode shows each product's email (--sample-product)", () => {
 
     it("defaults to the Large Venue Kit, and each choice shows that product with the migration's own license count", () => {
         assert.equal(modeOf("--sample", `--test-recipients=${SAMPLE_ONE}`).sampleProduct, "large");
-        const expected = { small: /Your Small Venue Kit includes 1 license\./, large: /Your Large Venue Kit includes 4 licenses\./, dyha: /Your Discover Your Health Age purchase includes 3 licenses\./ };
-        for (const product of ["small", "large", "dyha"] as const) {
+        const expected = {
+            existing: /Your New HealthAge Experience Is Ready![\s\S]*Registered Email: test\.customer@example\.com/,
+            small: /Your Small Venue Kit includes one license for your personal use\./,
+            large: /Your Large Venue Kit includes 4 licenses:/,
+            dyha: /Your Discover Your Health Age purchase includes 3 licenses:/,
+        };
+        const subjects = { existing: EMAIL_SUBJECTS.existing_customer, small: EMAIL_SUBJECTS.small_venue_kit, large: EMAIL_SUBJECTS.large_venue_kit, dyha: EMAIL_SUBJECTS.existing_customer };
+        for (const product of ["existing", "small", "large", "dyha"] as const) {
             const mode = modeOf("--sample", `--sample-product=${product}`, `--test-recipients=${SAMPLE_ONE}`);
             assert.equal(mode.sampleProduct, product);
             const content = renderSampleEmail(FULL_CONFIG, product);
             assert.match(content.text, expected[product]);
-            // Kit samples use the real per-unit license counts from the product rules; the DYHA sample is "- 3".
-            const expectedLicenses = product === "dyha" ? 3 : seatsPerUnit(`health_expo_screening_kit_${product}`);
+            assert.equal(content.subject, subjects[product], `${product}: the sample uses the real template for that product`);
+            // Kit samples use the real per-unit license counts from the product rules; the DYHA samples are "- 1" and "- 3".
+            const expectedLicenses = product === "dyha" ? 3 : product === "existing" ? 1 : seatsPerUnit(`health_expo_screening_kit_${product}`);
             assert.equal(buildSamplePurchase(product).licenses, expectedLicenses);
             assert.match(content.text, /sample date/);
-            assert.ok(content.text.includes(SAMPLE_ACCOUNT_EMAIL) && content.text.includes(SAMPLE_WORKSPACE_NAME));
+            assert.ok(content.text.includes(SAMPLE_ACCOUNT_EMAIL));
+            // The workspace is only part of the email when there are several licenses to manage (the workspace route).
+            assert.equal(content.text.includes(SAMPLE_WORKSPACE_NAME), buildSamplePurchase(product).licenses > 1, `${product}: workspace shown only for more than one license`);
         }
     });
 
