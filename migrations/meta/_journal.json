@@ -64,6 +64,13 @@
       "when": 1788700800000,
       "tag": "0009_user_status_disabled",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794268800000,
+      "tag": "0010_shopify_purchase_email_outbox",
+      "breakpoints": true
     }
   ]
 }

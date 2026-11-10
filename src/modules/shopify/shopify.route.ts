@@ -4,13 +4,18 @@ import z from "zod";
 
 import { env } from "@config/env";
 import { BadRequestError, UnauthorizedError } from "@core/errors/http-errors";
+import { queueShopifyPurchaseEmailDelivery, type PurchaseEmailOutboxDeps } from "./shopify.email-outbox";
 import {
     isExpectedShopifyShopDomain,
     recordShopifyWebhookEvent,
-    sendShopifyWorkspaceOwnerWelcomeEmail,
     SHOPIFY_ORDER_PAID_TOPIC,
     verifyShopifyWebhookHmac,
 } from "./shopify.service";
+
+export type ShopifyRouteOptions = {
+    /** Test seam: a fake SMTP transport and a controllable clock. Production leaves it unset. */
+    emailDeps?: PurchaseEmailOutboxDeps;
+};
 
 function headerString(value: string | string[] | undefined): string | null {
     if (typeof value === "string" && value.length > 0) {
@@ -34,7 +39,7 @@ const webhookSuccessSchema = {
 async function handleShopifyWebhook(
     app: FastifyInstance,
     req: FastifyRequest,
-    options: { defaultTopic?: string } = {}
+    options: { defaultTopic?: string; emailDeps?: PurchaseEmailOutboxDeps } = {}
 ): Promise<{ ok: true }> {
     if (!env.SHOPIFY_WEBHOOK_SECRET) {
         throw new BadRequestError("Shopify is not configured: missing SHOPIFY_WEBHOOK_SECRET");
@@ -100,8 +105,12 @@ async function handleShopifyWebhook(
         return { ok: true as const };
     }
 
-    if (result.ownerEmail) {
-        await sendShopifyWorkspaceOwnerWelcomeEmail(req.log, result.ownerEmail);
+    // The paid-order transaction has committed: the workspace and licenses are saved AND the confirmation is queued in the
+    // database (that happened inside the same transaction). Only now do we try to send it, in the background so Shopify
+    // gets its 200 at once. If this send fails or the process dies, nothing is lost: the background worker retries the
+    // queued email with backoff. An email problem can never undo or fail the order.
+    if (result.purchaseEmail) {
+        queueShopifyPurchaseEmailDelivery(app.db, req.log, result.purchaseEmail.shopifyOrderId, options.emailDeps);
     }
 
     req.log.info({ webhookId, topic, shopDomain }, "Processed Shopify webhook");
@@ -112,7 +121,7 @@ async function handleShopifyWebhook(
 /**
  * Compatibility Shopify webhook routes under /api/v1/shopify.
  */
-export const shopifyRoutes: FastifyPluginAsyncZod = async (app) => {
+export const shopifyRoutes: FastifyPluginAsyncZod<ShopifyRouteOptions> = async (app, opts) => {
     app.post(
         "/webhook",
         {
@@ -121,7 +130,7 @@ export const shopifyRoutes: FastifyPluginAsyncZod = async (app) => {
             },
             schema: webhookSuccessSchema,
         },
-        async (req) => handleShopifyWebhook(app, req)
+        async (req) => handleShopifyWebhook(app, req, { emailDeps: opts.emailDeps })
     );
 };
 
@@ -129,7 +138,7 @@ export const shopifyRoutes: FastifyPluginAsyncZod = async (app) => {
  * Shopify-configured order-paid webhook:
  * POST /shopify/webhooks/order-paid
  */
-export const shopifyOrderPaidWebhookRoutes: FastifyPluginAsyncZod = async (app) => {
+export const shopifyOrderPaidWebhookRoutes: FastifyPluginAsyncZod<ShopifyRouteOptions> = async (app, opts) => {
     app.post(
         "/order-paid",
         {
@@ -141,6 +150,6 @@ export const shopifyOrderPaidWebhookRoutes: FastifyPluginAsyncZod = async (app) 
                 summary: "Shopify order paid webhook receiver",
             },
         },
-        async (req) => handleShopifyWebhook(app, req, { defaultTopic: SHOPIFY_ORDER_PAID_TOPIC })
+        async (req) => handleShopifyWebhook(app, req, { defaultTopic: SHOPIFY_ORDER_PAID_TOPIC, emailDeps: opts.emailDeps })
     );
 };

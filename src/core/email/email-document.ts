@@ -51,6 +51,16 @@ export type Block =
      * (no bold or links), because those are coloured for a light background and would vanish on navy.
      */
     | { readonly type: "notice"; readonly title: string; readonly paragraphs: readonly string[] }
+    /**
+     * A confirmation strip: a gold check mark, a bold line and a muted line underneath
+     * (e.g. "Payment received" / "Order #1042"). Plain text only.
+     */
+    | { readonly type: "confirmation"; readonly title: string; readonly subtitle: string }
+    /**
+     * One key figure in a navy panel with a gold rule: a big value, a small label and an optional sentence
+     * (e.g. "4" / "licenses added to your workspace"). Plain text only (it sits on navy, like `notice`).
+     */
+    | { readonly type: "highlight"; readonly value: string; readonly label: string; readonly caption?: string }
     /** Numbered steps (numbering restarts at 1 for each steps block). */
     | { readonly type: "steps"; readonly steps: readonly Step[] }
     /** A line of text followed by one download button per platform. */
@@ -213,6 +223,14 @@ function renderText(doc: EmailDocument): string {
             case "notice":
                 lines.push(NOTICE_RULE, block.title, "");
                 for (const paragraph of block.paragraphs) lines.push(paragraph);
+                lines.push(NOTICE_RULE, "");
+                break;
+            case "confirmation":
+                lines.push(block.title, block.subtitle, "");
+                break;
+            case "highlight":
+                lines.push(NOTICE_RULE, `${block.value} ${block.label.toUpperCase()}`);
+                if (block.caption) lines.push(block.caption);
                 lines.push(NOTICE_RULE, "");
                 break;
             case "steps":
@@ -395,6 +413,33 @@ function blockHtml(block: Block): string {
                 block.paragraphs
                     .map((paragraph) => `<p style="margin:0 0 6px 0;font-family:${SANS};font-size:15px;line-height:24px;color:${COLOR.goldSoft};${WRAP}">${esc(paragraph)}</p>`)
                     .join("") +
+                `</td></tr></table>`
+            );
+        case "confirmation":
+            // A soft gold-tinted strip: a gold check disc beside a bold line and a muted line. Two cells, no fixed widths
+            // beyond the 44px disc column, so it holds together on a phone.
+            return (
+                `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:6px 0 18px 0;"><tr>` +
+                `<td bgcolor="${COLOR.goldSoft}" style="background-color:${COLOR.goldSoft};border:1px solid ${COLOR.gold};border-radius:8px;padding:14px 16px;">` +
+                `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"><tr>` +
+                `<td width="48" valign="middle" style="width:48px;min-width:48px;padding:0;">` +
+                `<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" valign="middle" bgcolor="${COLOR.gold}" style="background-color:${COLOR.gold};border-radius:18px;width:36px;height:36px;font-family:${SANS};font-size:19px;line-height:36px;font-weight:bold;color:${COLOR.navy};">&#10003;</td></tr></table>` +
+                `</td>` +
+                `<td valign="middle" style="padding:0;">` +
+                `<div style="font-family:${SANS};font-size:16px;line-height:22px;font-weight:bold;color:${COLOR.navy};${WRAP}">${esc(block.title)}</div>` +
+                `<div style="font-family:${SANS};font-size:14px;line-height:21px;color:${COLOR.muted};${WRAP}">${esc(block.subtitle)}</div>` +
+                `</td></tr></table></td></tr></table>`
+            );
+        case "highlight":
+            // The key figure: big gold number on navy, a small spaced label in white, an optional sentence in ivory.
+            return (
+                `<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:8px 0 18px 0;"><tr>` +
+                `<td align="center" bgcolor="${COLOR.navy}" style="background-color:${COLOR.navy};border-top:4px solid ${COLOR.gold};border-radius:6px;padding:22px 22px 20px 22px;">` +
+                `<div style="font-family:${SERIF};font-size:52px;line-height:56px;font-weight:bold;color:${COLOR.gold};">${esc(block.value)}</div>` +
+                `<div style="font-family:${SANS};font-size:13px;line-height:19px;letter-spacing:2px;text-transform:uppercase;color:${COLOR.white};padding-top:4px;${WRAP}">${esc(block.label)}</div>` +
+                (block.caption
+                    ? `<p style="margin:12px 0 0 0;font-family:${SANS};font-size:15px;line-height:23px;color:${COLOR.goldSoft};${WRAP}">${esc(block.caption)}</p>`
+                    : "") +
                 `</td></tr></table>`
             );
         case "steps":

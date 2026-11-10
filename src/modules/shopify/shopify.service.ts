@@ -3,17 +3,20 @@ import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 
 import { env } from "@config/env";
 import { billingEvents, shopifyOrders, shopifyShops, shopifySubscriptions, users, workspaceMembers, workspaces } from "@db/schema";
-import {
-    createWorkspaceSmtpTransport,
-    getWorkspaceInviteEmailContent,
-    inferWorkspaceDisplayName,
-} from "@modules/workspace/workspace.email";
+import { inferWorkspaceDisplayName } from "@modules/workspace/workspace.email";
 import { normalizeEmail } from "@modules/workspace/workspace.util";
 import { AUDIT_ACTIONS, AUDIT_TARGETS, recordAuditEvent } from "@modules/audit/audit.service";
 import type { ShopifyOrderStatus } from "./shopify.constants";
+import { enqueueShopifyPurchaseEmail } from "./shopify.email-outbox";
+import {
+    summarizeShopifyPurchaseLines,
+    type ShopifyPurchaseEmail,
+    type ShopifyPurchaseEmailContent,
+} from "./shopify.purchase-email";
 import {
     applyShopifyRefundToOrderSeats,
     extractShopifyCustomerId,
+    isShopifyOrderContributingLicenses,
     normalizeShopifyShopDomain,
     parseShopifyOrderLineItems,
     parseShopifyRefundLicenseReduction,
@@ -51,16 +54,11 @@ export {
 } from "./shopify.license";
 export type { ShopifyOrderLineItem } from "./shopify.license";
 
-export type ShopifyWorkspaceOwnerEmail = {
-    ownerEmail: string;
-    organizationName: string;
-    userName: string;
-    ownerMembershipStatus: "active" | "invited";
-};
+export type { ShopifyPurchaseEmail } from "./shopify.purchase-email";
 
 export type ShopifyWebhookRecordResult = {
     duplicate: boolean;
-    ownerEmail: ShopifyWorkspaceOwnerEmail | null;
+    purchaseEmail: ShopifyPurchaseEmail | null;
 };
 
 export const SHOPIFY_ORDER_PAID_TOPIC = "orders/paid";
@@ -423,6 +421,7 @@ async function loadShopifyOrderRecord(
     purchaserEmail: string;
     seatQuantity: number;
     orderNumber: string | null;
+    status: string;
 } | null> {
     const [savedOrder] = await db
         .select({
@@ -432,6 +431,7 @@ async function loadShopifyOrderRecord(
             purchaserEmail: shopifyOrders.purchaserEmail,
             seatQuantity: shopifyOrders.seatQuantity,
             orderNumber: shopifyOrders.orderNumber,
+            status: shopifyOrders.status,
         })
         .from(shopifyOrders)
         .where(eq(shopifyOrders.id, shopifyOrderRecordId))
@@ -548,6 +548,7 @@ async function loadShopifyWorkspace(
 ): Promise<{
     id: string;
     name: string;
+    ownerEmail: string;
     status: string;
     subscriptionStatus: string;
     seatLimit: number;
@@ -557,6 +558,7 @@ async function loadShopifyWorkspace(
         .select({
             id: workspaces.id,
             name: workspaces.name,
+            ownerEmail: workspaces.ownerEmail,
             status: workspaces.status,
             subscriptionStatus: workspaces.subscriptionStatus,
             seatLimit: workspaces.seatLimit,
@@ -795,6 +797,80 @@ export async function handleShopifyRefundCreated(
     });
 }
 
+/**
+ * The facts for the purchase confirmation email of an order that has just been allocated licenses. Returns null
+ * (and says why in the log) when no confirmation should go out: the order is no longer a paid, live order
+ * (cancelled or refunded before this delivery was processed), or none of its lines is a supported product.
+ */
+function assemblePurchaseEmail(
+    log: FastifyBaseLogger,
+    input: {
+        scenario: ShopifyPurchaseEmailContent["scenario"];
+        order: ParsedShopifyOrderWebhook;
+        savedOrder: { shopifyOrderId: string; orderNumber: string | null; seatQuantity: number; status: string };
+        recipientEmail: string;
+        recipientName: string;
+        workspace: { id: string; name: string; ownerEmail: string };
+        accountExists: boolean;
+        workspaceTotalLicenses: number;
+        accessExpiresAt: Date | null;
+    }
+): ShopifyPurchaseEmail | null {
+    const { savedOrder } = input;
+
+    if (!isShopifyOrderContributingLicenses(savedOrder.status)) {
+        log.warn(
+            { shopifyOrderId: savedOrder.shopifyOrderId, workspaceId: input.workspace.id, status: savedOrder.status },
+            "Not sending Shopify purchase confirmation: the order is already cancelled or refunded"
+        );
+        return null;
+    }
+
+    const { lines, hasOtherItems } = summarizeShopifyPurchaseLines(input.order.lineItems);
+    if (lines.length === 0) {
+        return null;
+    }
+
+    return {
+        recipientEmail: input.recipientEmail,
+        customerName: input.recipientName,
+        orderNumber: savedOrder.orderNumber,
+        scenario: input.scenario,
+        workspaceName: input.workspace.name,
+        workspaceOwnerEmail: input.workspace.ownerEmail,
+        accountExists: input.accountExists,
+        lines,
+        // What was really allocated (the saved order's seats), so the email can never claim more than the workspace got.
+        licensesAdded: savedOrder.seatQuantity,
+        workspaceTotalLicenses: input.workspaceTotalLicenses,
+        // ISO strings, so the snapshot stored with the order is exactly this object.
+        purchasedAt: input.order.paidAt.toISOString(),
+        accessExpiresAt: input.accessExpiresAt ? input.accessExpiresAt.toISOString() : null,
+        hasOtherItems,
+        workspaceId: input.workspace.id,
+        shopifyOrderId: savedOrder.shopifyOrderId,
+    };
+}
+
+/**
+ * Assembles the confirmation and queues it in the durable outbox. This runs INSIDE the paid-order transaction, right after
+ * the workspace or licenses were written, so the queued email and the allocation are one atomic unit: both commit or neither
+ * does. Nothing is sent here; the send happens after the commit (see shopify.email-outbox.ts). Returns the email only when
+ * it is really queued, so a repeat delivery that allocated nothing never produces one.
+ */
+async function assembleAndQueuePurchaseEmail(
+    db: DbExecutor,
+    log: FastifyBaseLogger,
+    shopifyOrderRecordId: string,
+    input: Parameters<typeof assemblePurchaseEmail>[1]
+): Promise<ShopifyPurchaseEmail | null> {
+    const email = assemblePurchaseEmail(log, input);
+    if (!email) {
+        return null;
+    }
+    return (await enqueueShopifyPurchaseEmail(db, log, { shopifyOrderRecordId, email })) ? email : null;
+}
+
 export async function provisionWorkspaceFromShopifyPaidOrder(
     db: DbExecutor,
     log: FastifyBaseLogger,
@@ -803,7 +879,7 @@ export async function provisionWorkspaceFromShopifyPaidOrder(
         shopId: string;
         order: ParsedShopifyOrderWebhook;
     }
-): Promise<ShopifyWorkspaceOwnerEmail | null> {
+): Promise<ShopifyPurchaseEmail | null> {
     const savedOrder = await loadShopifyOrderRecord(db, input.shopifyOrderRecordId);
     if (!savedOrder) {
         throw new Error(`Shopify order record not found: ${input.shopifyOrderRecordId}`);
@@ -863,7 +939,7 @@ export async function provisionWorkspaceFromShopifyPaidOrder(
             newPaidAt: input.order.paidAt,
         });
 
-        await syncShopifyWorkspaceLicenseState(db, log, {
+        const { remainingLicenses } = await syncShopifyWorkspaceLicenseState(db, log, {
             workspaceId: existingWorkspaceId,
             shopifyOrderId: savedOrder.shopifyOrderId,
             reason: "paid",
@@ -882,7 +958,24 @@ export async function provisionWorkspaceFromShopifyPaidOrder(
             "Added Shopify licenses to existing workspace"
         );
 
-        return null;
+        // A repeat purchase gets its own confirmation: how many licenses were added and the new total. The person who
+        // signs in is the workspace owner, which is usually the buyer but can be another address on the same customer.
+        const purchaserUser = await findUserByEmail(db, ownerEmail);
+        const workspaceOwnerEmail = normalizeEmail(existingWorkspace.ownerEmail);
+        const workspaceOwnerUser =
+            workspaceOwnerEmail === ownerEmail ? purchaserUser : await findUserByEmail(db, workspaceOwnerEmail);
+
+        return assembleAndQueuePurchaseEmail(db, log, savedOrder.id, {
+            scenario: "existing_workspace",
+            order: input.order,
+            savedOrder,
+            recipientEmail: ownerEmail,
+            recipientName: inferWorkspaceDisplayName(ownerEmail, purchaserUser?.name ?? input.order.customerName),
+            workspace: { id: existingWorkspace.id, name: existingWorkspace.name, ownerEmail: workspaceOwnerEmail },
+            accountExists: workspaceOwnerUser !== null,
+            workspaceTotalLicenses: remainingLicenses,
+            accessExpiresAt: expiresAt,
+        });
     }
 
     const existingUser = await findUserByEmail(db, ownerEmail);
@@ -975,59 +1068,19 @@ export async function provisionWorkspaceFromShopifyPaidOrder(
         "Workspace created from Shopify order"
     );
 
-    return {
-        ownerEmail,
-        organizationName: workspaceName,
-        userName: inferWorkspaceDisplayName(ownerEmail, existingUser?.name ?? input.order.customerName),
-        ownerMembershipStatus,
-    };
-}
-
-export async function sendShopifyWorkspaceOwnerWelcomeEmail(
-    log: FastifyBaseLogger,
-    input: ShopifyWorkspaceOwnerEmail
-): Promise<void> {
-    const subject =
-        input.ownerMembershipStatus === "active"
-            ? "Your organization has been created."
-            : "Complete registration to access your workspace.";
-
-    try {
-        const smtpTransport = createWorkspaceSmtpTransport();
-        const ownerMail = getWorkspaceInviteEmailContent({
-            organizationName: input.organizationName,
-            userName: input.userName,
-            userEmail: input.ownerEmail,
-            isOwner: true,
-            subject,
-        });
-
-        await smtpTransport.sendMail({
-            from: env.EMAIL_FROM ?? env.SMTP_USER,
-            to: input.ownerEmail,
-            subject: ownerMail.subject,
-            text: ownerMail.text,
-            html: ownerMail.html,
-        });
-
-        log.info(
-            {
-                to: input.ownerEmail,
-                subject,
-                ownerMembershipStatus: input.ownerMembershipStatus,
-            },
-            "Sent Shopify workspace owner email"
-        );
-    } catch (error) {
-        log.error(
-            {
-                err: error,
-                to: input.ownerEmail,
-                ownerMembershipStatus: input.ownerMembershipStatus,
-            },
-            "Failed to send Shopify workspace owner email"
-        );
-    }
+    // The new workspace's welcome IS the purchase confirmation (it carries the set-up and sign-in instructions), so a
+    // first purchase gets exactly one email, and only once this transaction has committed.
+    return assembleAndQueuePurchaseEmail(db, log, savedOrder.id, {
+        scenario: "new_workspace",
+        order: input.order,
+        savedOrder,
+        recipientEmail: ownerEmail,
+        recipientName: inferWorkspaceDisplayName(ownerEmail, existingUser?.name ?? input.order.customerName),
+        workspace: { id: workspace.id, name: workspaceName, ownerEmail },
+        accountExists: ownerMembershipStatus === "active",
+        workspaceTotalLicenses: savedOrder.seatQuantity,
+        accessExpiresAt: expiresAt,
+    });
 }
 
 export async function processShopifyOrderWebhook(
@@ -1038,7 +1091,7 @@ export async function processShopifyOrderWebhook(
         shopDomain: string;
         payload: Record<string, unknown>;
     }
-): Promise<ShopifyWorkspaceOwnerEmail | null> {
+): Promise<ShopifyPurchaseEmail | null> {
     const order = parseShopifyOrderWebhook({
         topic: input.topic,
         shopDomain: input.shopDomain,
@@ -1507,7 +1560,7 @@ export async function recordShopifyWebhookEvent(
         log: FastifyBaseLogger;
     }
 ): Promise<ShopifyWebhookRecordResult> {
-    let ownerEmail: ShopifyWorkspaceOwnerEmail | null = null;
+    let purchaseEmail: ShopifyPurchaseEmail | null = null;
 
     const duplicate = await app.db.transaction(async (tx) => {
         const [insertedEvent] = await tx
@@ -1542,7 +1595,7 @@ export async function recordShopifyWebhookEvent(
                 throw new Error("Missing X-Shopify-Shop-Domain header for Shopify order webhook");
             }
 
-            ownerEmail = await processShopifyOrderWebhook(tx, input.log, {
+            purchaseEmail = await processShopifyOrderWebhook(tx, input.log, {
                 topic: input.topic,
                 shopDomain: input.shopDomain,
                 payload: input.payloadJson,
@@ -1557,5 +1610,7 @@ export async function recordShopifyWebhookEvent(
         return false;
     });
 
-    return { duplicate, ownerEmail };
+    // Only reached once the transaction above has committed. A rolled-back transaction throws before this line, so a
+    // purchase email can never describe a workspace or license that was not saved. A duplicate carries no email.
+    return { duplicate, purchaseEmail: duplicate ? null : purchaseEmail };
 }

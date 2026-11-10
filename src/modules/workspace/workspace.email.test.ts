@@ -258,7 +258,7 @@ describe("owner / organization welcome email", () => {
     });
 
     it("Shopify owner-welcome email (owner variant with a custom subject) keeps its subject and links the portal", () => {
-        // sendShopifyWorkspaceOwnerWelcomeEmail builds its message with exactly these inputs.
+        // The generic owner variant with a custom subject (used by the admin-created workspace flow). Shopify purchases now send the product-specific email from shopify.purchase-email.ts instead.
         const email = getWorkspaceInviteEmailContent({
             organizationName: "Eastwood SDA Church",
             userName: "Rhonda McMorris",
@@ -368,7 +368,7 @@ describe("Workspace Admin link has a single source and no stale copies", () => {
         assert.deepEqual(offenders, []);
     });
 
-    it("there is ONE invitation template: both routes and the Shopify welcome use the shared builder, with no local copy", () => {
+    it("there is ONE invitation template: both routes use the shared builder; the Shopify purchase email is built on the shared design system, with no local copy", () => {
         for (const file of ["src/modules/workspace/workspace.route.ts", "src/modules/admin/admin-workspace.route.ts"]) {
             const source = read(file);
             assert.match(source, /import \{[^}]*getWorkspaceInviteEmailContent[^}]*\} from "(\.|@modules\/workspace)\/workspace\.email"/, `${file} imports the shared builder`);
@@ -376,9 +376,19 @@ describe("Workspace Admin link has a single source and no stale copies", () => {
             assert.equal(/Hello \$\{|You’ve been added to the Pro account/.test(source), false, `${file} has no inline email text`);
             assert.equal(source.includes("${WORKSPACE_ADMIN_URL}"), false, `${file} does not build the link itself`);
         }
+        // Shopify purchases send the product-specific confirmation (shopify.purchase-email.ts). The service only
+        // supplies facts and environment values; the markup and the links come from the shared design system and
+        // the single link source, never from a copy.
+        // The service only queues it; the delivery module builds it (with the environment's links) and sends it.
         const shopify = read("src/modules/shopify/shopify.service.ts");
-        assert.match(shopify, /getWorkspaceInviteEmailContent[\s\S]*?from "@modules\/workspace\/workspace\.email"/);
-        assert.ok(shopify.includes("isOwner: true"));
+        assert.equal(/Hello \$\{|<table|<html/i.test(shopify), false, "the Shopify service has no inline email text or markup");
+        const delivery = read("src/modules/shopify/shopify.email-delivery.ts");
+        assert.match(delivery, /buildShopifyPurchaseEmail[\s\S]*?from "\.\/shopify\.purchase-email"/);
+        assert.equal(/Hello \$\{|<table|<html/i.test(delivery), false, "the delivery module has no inline email text or markup");
+        const purchaseEmail = read("src/modules/shopify/shopify.purchase-email.ts");
+        assert.match(purchaseEmail, /from "\.\.\/\.\.\/core\/email\/email-document"/);
+        assert.match(purchaseEmail, /WORKSPACE_ADMIN_URL[\s\S]*?from "\.\.\/workspace\/workspace\.links"/);
+        assert.equal(/<table|<html/i.test(purchaseEmail), false, "the purchase email builds no markup of its own");
     });
 
     it("the member-invitation sites pass the role, the inviter's name and the workspace's access end date", () => {

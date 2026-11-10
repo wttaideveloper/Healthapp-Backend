@@ -21,6 +21,8 @@ services:
       dockerfile: Dockerfile
     container_name: healthage-backend-app
     restart: unless-stopped
+    # Shutdown waits up to 25 s for purchase emails being sent (PURCHASE_EMAIL_SHUTDOWN_GRACE_MS); docker's default is 10 s.
+    stop_grace_period: 40s
     depends_on:
       postgres:
         condition: service_healthy

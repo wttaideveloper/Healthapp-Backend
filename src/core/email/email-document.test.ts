@@ -313,3 +313,95 @@ describe("email design system: helpers", () => {
         assert.equal(count(3, "additional member"), "3 additional members");
     });
 });
+
+describe("email design system: the confirmation strip and the highlight panel", () => {
+    const doc = (blocks: EmailDocument["blocks"]): EmailDocument => ({
+        subject: "Subject",
+        preheader: "Preheader",
+        title: "Title",
+        greeting: "Hello,",
+        blocks,
+        help: ["Help"],
+        closing: ["Closing"],
+        signOff: ["Regards,", "Sender"],
+        recipientNote: "Note",
+    });
+
+    const confirmation = { type: "confirmation", title: `Payment received ${hostile}`, subtitle: `Order #1 ${hostile}` } as const;
+    const highlight = { type: "highlight", value: "4", label: `licenses added ${hostile}`, caption: `Caption ${hostile}` } as const;
+    const { html, text } = renderEmailDocument(doc([confirmation, highlight]));
+
+    it("escapes hostile text in both blocks", () => {
+        assert.doesNotMatch(html, /<script/i);
+        for (const field of [`Payment received ${escapedHostile}`, `Order #1 ${escapedHostile}`, `licenses added ${escapedHostile}`, `Caption ${escapedHostile}`]) {
+            assert.ok(html.includes(field), field);
+        }
+    });
+
+    it("the confirmation strip is a gold-tinted table row with a gold check mark, bold title and muted subtitle", () => {
+        assert.ok(html.includes(`bgcolor="${COLOR.goldSoft}"`));
+        assert.ok(html.includes(`border:1px solid ${COLOR.gold}`));
+        assert.ok(html.includes("&#10003;"));
+        assert.match(html, new RegExp(`font-weight:bold;color:${COLOR.navy};[^>]*>Payment received`));
+        assert.match(html, new RegExp(`color:${COLOR.muted};[^>]*>Order #1`));
+    });
+
+    it("the highlight is a navy panel with a gold rule, a big gold figure and an ivory caption, centred in one column", () => {
+        assert.ok(html.includes(`border-top:4px solid ${COLOR.gold}`));
+        assert.match(html, new RegExp(`font-size:52px;line-height:56px;font-weight:bold;color:${COLOR.gold};">4</div>`));
+        assert.match(html, new RegExp(`color:${COLOR.goldSoft};[^>]*>Caption`));
+        assert.match(html, /<td align="center" bgcolor="#0B2545"/);
+    });
+
+    it("the caption is optional", () => {
+        const bare = renderEmailDocument(doc([{ type: "highlight", value: "1", label: "license" }]));
+        assert.ok(bare.html.includes(">1</div>"));
+        assert.doesNotMatch(bare.html, /<p style="margin:12px 0 0 0/);
+        assert.match(bare.text, /^={60}\n1 LICENSE\n={60}$/m);
+    });
+
+    it("both blocks are in the plain-text version with the same words", () => {
+        assert.match(text, /Payment received <script>alert\("x"\)<\/script> & O'Brien\nOrder #1 /);
+        assert.ok(text.includes(`${"=".repeat(60)}\n4 LICENSES ADDED ${hostile.toUpperCase()}\nCaption ${hostile}\n${"=".repeat(60)}`));
+        assert.doesNotMatch(text, /&#10003;|<table/);
+    });
+
+    it("uses table layout and inline CSS only, with nothing fixed wider than the 600px column", () => {
+        assert.doesNotMatch(html, /<style|<img|<script/i);
+        assert.doesNotMatch(html, /width:(?:6[1-9]\d|[7-9]\d\d|\d{4,})px/);
+    });
+
+    it("leaves every existing block's output unchanged: a document without the new blocks renders exactly as before", () => {
+        const before = renderEmailDocument(everything()).html;
+        assert.doesNotMatch(before, /&#10003;|font-size:52px/);
+    });
+});
+
+describe("email design system: colour contrast of the pairs the new blocks use", () => {
+    const channel = (value: number): number => {
+        const c = value / 255;
+        return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    };
+    const luminance = (hex: string): number => {
+        const [r, g, b] = [1, 3, 5].map((i) => channel(parseInt(hex.slice(i, i + 2), 16))) as [number, number, number];
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const ratio = (a: string, b: string): number => {
+        const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x) as [number, number];
+        return (hi + 0.05) / (lo + 0.05);
+    };
+
+    it("meets WCAG AA (4.5:1 for text, 3:1 for the 52px figure) on every pair", () => {
+        const textPairs: Array<[string, string, string]> = [
+            ["white on navy (label)", COLOR.white, COLOR.navy],
+            ["ivory on navy (caption)", COLOR.goldSoft, COLOR.navy],
+            ["navy on ivory (title)", COLOR.navy, COLOR.goldSoft],
+            ["muted on ivory (subtitle)", COLOR.muted, COLOR.goldSoft],
+            ["navy on gold (check mark)", COLOR.navy, COLOR.gold],
+        ];
+        for (const [name, foreground, background] of textPairs) {
+            assert.ok(ratio(foreground, background) >= 4.5, `${name}: ${ratio(foreground, background).toFixed(2)}:1`);
+        }
+        assert.ok(ratio(COLOR.gold, COLOR.navy) >= 3, `gold figure on navy: ${ratio(COLOR.gold, COLOR.navy).toFixed(2)}:1`);
+    });
+});

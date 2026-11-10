@@ -12,6 +12,7 @@ import { errorHandlerPlugin } from "@plugins/error-handler.plugin";
 import { dbLivePlugin } from "@plugins/db-live.plugin";
 import { dbPlugin } from "@plugins/db.plugin";
 import { authPlugin } from "@plugins/auth.plugin";
+import { shopifyEmailOutboxPlugin } from "@plugins/shopify-email-outbox.plugin";
 import { healthRoutes } from "./modules/health/health.route";
 import { authRoutes } from "./modules/auth/auth.route";
 import { entitlementRoutes } from "./modules/entitlement/entitlement.route";
@@ -133,6 +134,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     /* ---------------- PLUGINS (ORDER MATTERS) ---------------- */
     await app.register(dbPlugin);            // app.db + app.pgPool
     await app.register(dbLivePlugin);        // app.isDbLive
+    await app.register(shopifyEmailOutboxPlugin); // purchase email retries + crash recovery (after db, so it closes before it)
     await app.register(authPlugin);
     await app.register(errorHandlerPlugin);   // custom error handler
 

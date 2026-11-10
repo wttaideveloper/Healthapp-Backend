@@ -52,6 +52,8 @@ const envSchema = z.object({
     SHOPIFY_ACCESS_TOKEN: z.string().min(1).optional(),
     /** Store hostname, e.g. example.myshopify.com. Used to validate incoming webhooks. */
     SHOPIFY_SHOP_DOMAIN: z.string().min(1).optional(),
+    /** Set to "false" to switch the Shopify purchase email retry/recovery worker off on this server. On by default. */
+    SHOPIFY_EMAIL_WORKER_ENABLED: z.enum(['true', 'false']).optional(),
 
 });
 
