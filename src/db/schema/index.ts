@@ -17,6 +17,7 @@ export * from "./workspace-members";
 export * from "./shopify-orders";
 export * from "./shopify-subscriptions";
 export * from "./audit-logs";
+export * from "./health-reports";
 
 // relations (after tables)
 export * from "./relations";

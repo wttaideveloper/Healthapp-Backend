@@ -71,6 +71,13 @@
       "when": 1794268800000,
       "tag": "0010_shopify_purchase_email_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1795392000000,
+      "tag": "0011_health_report_cloud_sync",
+      "breakpoints": true
     }
   ]
 }

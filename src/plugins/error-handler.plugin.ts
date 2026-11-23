@@ -64,8 +64,13 @@ async function errorHandlerPluginCore(app: FastifyInstance) {
             });
         }
 
-        // Unknown / programming error
-        req.log.error({ err: error }, "Unhandled error");
+        // Unknown / programming error.
+        // F7: Log only safe, allowlisted properties. Never serialize complete ORM error
+        // objects, which may carry query parameters or database context.
+        const safeErr = error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : { name: "UnknownError", message: String(error) };
+        req.log.error({ err: safeErr }, "Unhandled error");
 
         return reply.status(500).send({
             error: {
