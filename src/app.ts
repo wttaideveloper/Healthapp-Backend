@@ -24,6 +24,7 @@ import { workspaceRoutes } from "./modules/workspace/workspace.route";
 import { legalRoutes } from "./modules/legal/legal.route";
 import { shopifyOrderPaidWebhookRoutes, shopifyRoutes } from "./modules/shopify/shopify.route";
 import { reportSyncRoutes } from "./modules/report-sync/report-sync.route";
+import { appVersionRoutes } from "./modules/app-version/app-version.route";
 
 /** Swagger UI is developer tooling: off in production unless explicitly forced on. */
 const isSwaggerEnabled =
@@ -146,6 +147,8 @@ export async function buildApp(): Promise<FastifyInstance> {
 
     const typedApp = app.withTypeProvider<ZodTypeProvider>();
     typedApp.register(healthRoutes, { prefix: '/api/v1/health' });
+    // Public, no authentication: apps ask before anyone signs in.
+    typedApp.register(appVersionRoutes, { prefix: "/api/v1/app-version" });
     typedApp.register(authRoutes, { prefix: "/api/v1/auth" });
     typedApp.register(entitlementRoutes, { prefix: "/api/v1/entitlements" });
     typedApp.register(workspaceRoutes, { prefix: "/api/v1/workspaces" });

@@ -259,6 +259,46 @@ Workspace admin:
 - `PATCH /api/v1/workspaces/:id/members/:memberId`
 - `DELETE /api/v1/workspaces/:id/members/:memberId`
 
+App updates (public, no authentication):
+
+- `GET /api/v1/app-version/:platform`
+
+## App Update Versions
+
+`GET /api/v1/app-version/:platform` tells an app which version is current for its platform. `platform` is one of `android`, `ios`, `windows-store`, `windows-direct`, `macos`, `web`; anything else gets the standard `400` validation error. No token is needed and the answer never depends on an account. Responses carry `Cache-Control: public, max-age=300` and the route is limited to 60 requests per minute per IP.
+
+```json
+{
+  "platform": "android",
+  "latestVersion": "1.0.3",
+  "minimumSupportedVersion": "1.0.0",
+  "updateUrl": "https://play.google.com/store/apps/details?id=com.wtt.healthAge",
+  "releaseNotes": "Performance improvements and bug fixes.",
+  "releasedAt": "2026-11-26T00:00:00.000Z"
+}
+```
+
+Every field is always present; `null` means "not configured", and clients treat a missing version as "no update information". The server only reports these values: each app compares its own version with them and decides whether to suggest or require an update.
+
+Configuration (all optional, read at start-up; `<PLATFORM>` is `ANDROID`, `IOS`, `WINDOWS_STORE`, `WINDOWS_DIRECT`, `MACOS` or `WEB`):
+
+| Variable | Meaning |
+| --- | --- |
+| `APP_VERSION_<PLATFORM>_LATEST` | Newest version users can install now, `MAJOR.MINOR.PATCH` |
+| `APP_VERSION_<PLATFORM>_MINIMUM` | Oldest supported version; requires `_LATEST` and must not be higher |
+| `APP_VERSION_<PLATFORM>_RELEASE_NOTES` | Plain text, at most 1000 characters |
+| `APP_VERSION_<PLATFORM>_RELEASED_AT` | ISO 8601 date-time, for example `2026-11-26T00:00:00Z` (served in UTC) |
+| `HEALTHAGE_WINDOWS_DIRECT_URL` | `https` page offering the direct Windows installer (no default) |
+| `HEALTHAGE_WEB_URL` | `https` address of the web app (no default) |
+
+`updateUrl` reuses the links the customer emails use: `HEALTHAGE_ANDROID_URL`, `HEALTHAGE_IOS_URL`, `HEALTHAGE_WINDOWS_URL` (`windows-store`) and `HEALTHAGE_MACOS_URL` (the macOS desktop download page), with the defaults in `src/modules/workspace/workspace.links.ts`, plus the two variables above.
+
+Rules:
+
+- Only set `_LATEST` to a version that is already live in that platform's store or on its download page. Otherwise clients would be told to update to something they cannot get yet.
+- A blank value counts as unset. An invalid value (not `MAJOR.MINOR.PATCH`, a `_MINIMUM` without `_LATEST` or above it, a malformed date or URL) stops the server from starting, like any other invalid variable, so check the values before deploying.
+- Changes take effect after a restart, and reach clients within about 5 minutes of it (the cache lifetime).
+
 ## Stripe Setup
 
 Set the webhook endpoint in Stripe Dashboard:
